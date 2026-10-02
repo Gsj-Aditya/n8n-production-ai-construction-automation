@@ -104,7 +104,7 @@ flowchart LR
 - Unsafe retry refusal and successful Slack-only recovery
 - Operations dashboard and correlation trace
 
-See [`docs/test-results.md`](docs/test-results.md).
+See [`docs/03-test-evidence.md`](docs/03-test-evidence.md).
 
 ## Technology
 
@@ -119,17 +119,38 @@ See [`docs/test-results.md`](docs/test-results.md).
 ## Repository structure
 
 ```text
-workflows/     Sanitized n8n workflow templates
-schemas/       Input, AI-output, and Data Table schemas
-samples/       Synthetic request fixtures
-docs/          Architecture, setup, handoff, tests, and demo material
+workflows/
+  01-main-automation.json
+  02-central-error-handler.json
+  03-safe-reprocessor.json
+  04-operations-health.json
+  05-correlation-trace.json
+
+docs/
+  01-architecture.md
+  02-setup-and-handoff.md
+  03-test-evidence.md
+
+config/
+  ai/            LLM system prompt and classification boundaries
+  schemas/       Inbound and structured AI-output contracts
+  data-tables/   Persistent table definitions
+
+examples/        Four representative synthetic inquiry payloads
+docker-compose.yml
 ```
+
+The numbered workflow and document names show the recommended reading/import order.
+
+## Why the AI system prompt is included
+
+[`config/ai/classifier-system-prompt.md`](config/ai/classifier-system-prompt.md) is the instruction sent to Groq before each inquiry. It defines what the model may extract, the allowed classifications and signals, and what it must leave to deterministic workflow rules. Including it lets a reviewer evaluate the AI boundary rather than treating the model call as a black box.
 
 ## Running the project
 
 The workflows are inactive templates. Import them, create your own credentials and Data Tables, replace all `CONFIGURE_*` placeholders, link the Error Handler in the main workflow settings, and publish only after completing the setup checklist.
 
-See [`docs/setup-and-handoff.md`](docs/setup-and-handoff.md).
+See [`docs/02-setup-and-handoff.md`](docs/02-setup-and-handoff.md).
 
 ## Security
 

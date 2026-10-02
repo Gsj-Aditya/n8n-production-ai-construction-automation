@@ -19,7 +19,7 @@
 
 ## Configuration checklist
 
-1. Create Data Tables from `schemas/data-tables/`.
+1. Create Data Tables from `config/data-tables/`.
 2. Select the correct table in every Data Table node.
 3. Select Groq, HubSpot, Gmail, Slack, and Header Auth credentials.
 4. Replace controlled test email and Slack channel placeholders.
