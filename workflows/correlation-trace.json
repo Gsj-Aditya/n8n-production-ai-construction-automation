@@ -1,0 +1,187 @@
+{
+  "name": "V4 - Construction Correlation Trace",
+  "description": "Portfolio template: AI-enriched construction inquiry intake with idempotency, Groq classification, deterministic rules, HubSpot Contact/Deal synchronization, retries, fallbacks, and persistent audit status.",
+  "nodes": [
+    {
+      "id": "b56188d0-a803-4a5b-8b18-2b7289c15a2f",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "551c3128-5518-41d6-8bce-1e438af6a947",
+      "name": "Select Trace Target",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const TARGET_CORRELATION_ID = 'CONFIGURE_CORRELATION_ID';\nreturn [{ json: { trace_request: {\n  correlation_id: TARGET_CORRELATION_ID,\n  requested_at: new Date().toISOString(),\n} } }];"
+      }
+    },
+    {
+      "id": "7a6a3147-66ed-4168-8d08-832fe115132b",
+      "name": "Get Inquiry by Correlation ID",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "returnAll": false,
+        "limit": 1,
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "correlation_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.trace_request.correlation_id }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "3cb8df3d-c5eb-4187-8464-4dd20b3a57aa",
+      "name": "Attach Trace Inquiry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const request = $('Select Trace Target').first().json;\nreturn $input.all().map((item) => {\n  if (!item.json?.inquiry_id) throw new Error(`Inquiry not found for correlation ID ${request.trace_request.correlation_id}`);\n  return { json: { ...request, inquiry: item.json } };\n});"
+      }
+    },
+    {
+      "id": "ca2a7ea3-fadc-42c4-9fd3-dd48cafa9b70",
+      "name": "Get Inquiry Dead Letters",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        0
+      ],
+      "alwaysOutputData": true,
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_dead_letters_v4"
+        },
+        "returnAll": true,
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "inquiry_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.inquiry.inquiry_id }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9a0a45e9-dd6a-4a9a-bccf-527f0b3afb36",
+      "name": "Build Correlation Trace",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const context = $('Attach Trace Inquiry').first().json;\nconst inquiry = context.inquiry;\nconst deadLetters = $input.all().map((item) => item.json).filter((row) => row?.dead_letter_id);\nreturn [{ json: {\n  trace_generated_at: new Date().toISOString(),\n  identity: {\n    inquiry_id: inquiry.inquiry_id,\n    correlation_id: inquiry.correlation_id,\n    execution_id: inquiry.execution_id,\n    source_event_id: inquiry.source_event_id,\n  },\n  current_state: {\n    automation_status: inquiry.automation_status,\n    processing_stage: inquiry.processing_stage,\n    last_successful_stage: inquiry.last_successful_stage,\n    ai_status: inquiry.ai_status,\n    acknowledgment_status: inquiry.ack_status,\n    slack_status: inquiry.slack_status,\n    followup_status: inquiry.followup_status,\n    reprocessing_status: inquiry.reprocessing_status,\n  },\n  external_ids: {\n    hubspot_contact_id: inquiry.hubspot_contact_id || null,\n    hubspot_deal_id: inquiry.hubspot_deal_id || null,\n    dead_letter_id: inquiry.dead_letter_id || null,\n  },\n  timing: {\n    received_at: inquiry.received_at,\n    stored_at: inquiry.stored_at,\n    processing_started_at: inquiry.processing_started_at,\n    processing_finished_at: inquiry.processing_finished_at,\n    processing_duration_ms: inquiry.processing_duration_ms,\n    last_reprocessed_at: inquiry.last_reprocessed_at || null,\n  },\n  current_error: inquiry.error_stage ? {\n    stage: inquiry.error_stage,\n    category: inquiry.error_category,\n    message: inquiry.last_error,\n  } : null,\n  dead_letter_history: deadLetters.map((row) => ({\n    dead_letter_id: row.dead_letter_id,\n    failed_execution_id: row.failed_execution_id,\n    failed_node: row.failed_node,\n    stage: row.error_stage,\n    category: row.error_category,\n    status: row.status,\n    attempt_count: row.attempt_count,\n    created_at: row.created_at,\n    last_attempt_at: row.last_attempt_at || null,\n    resolved_at: row.resolved_at || null,\n    resolution_note: row.resolution_note || null,\n  })),\n  recommended_action: inquiry.reprocessing_status === 'pending_review'\n    ? 'Review the linked open dead letter before retrying.'\n    : inquiry.reprocessing_status === 'resolved'\n      ? 'No recovery action required; retain as audit evidence.'\n      : 'Review current lifecycle state.',\n} }];"
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Select Trace Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select Trace Target": {
+      "main": [
+        [
+          {
+            "node": "Get Inquiry by Correlation ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Inquiry by Correlation ID": {
+      "main": [
+        [
+          {
+            "node": "Attach Trace Inquiry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Trace Inquiry": {
+      "main": [
+        [
+          {
+            "node": "Get Inquiry Dead Letters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Inquiry Dead Letters": {
+      "main": [
+        [
+          {
+            "node": "Build Correlation Trace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {},
+  "active": false,
+  "tags": [],
+  "isArchived": false,
+  "nodeGroups": [],
+  "sourceWorkflowId": null
+}

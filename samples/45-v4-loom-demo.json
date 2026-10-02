@@ -1,0 +1,8 @@
+{
+  "source": "website_form",
+  "source_event_id": "web_v4_loom_0001",
+  "received_at": "2026-10-02T09:30:00Z",
+  "customer": { "name": "Jordan Blake", "email": "jordan.blake.loom@example.com", "phone": "+1-718-555-0146" },
+  "message": { "subject": "Urgent storm damage inspection", "body": "Water is actively entering our Brooklyn townhouse after last night's storm and part of the ceiling is sagging. We need an urgent roof inspection today. Our initial repair budget is $25,000.", "channel": "form" },
+  "metadata": { "page_url": "https://summit-ridge.example/emergency-roofing", "utm_source": "loom_demo", "location_hint": "Brooklyn, NY" }
+}

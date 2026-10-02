@@ -1,0 +1,8 @@
+{
+  "source": "website_form",
+  "source_event_id": "web_v4_0009",
+  "received_at": "2026-10-02T08:45:00Z",
+  "customer": { "name": "Avery Morgan", "email": "avery.morgan.v4@example.com", "phone": "+1-718-555-0193" },
+  "message": { "subject": "Active roof leak and sagging ceiling", "body": "Rainwater is actively entering our Brooklyn townhouse through the roof and the ceiling is starting to sag. We need an urgent inspection today. Our repair budget is approximately $20,000.", "channel": "form" },
+  "metadata": { "page_url": "https://summit-ridge.example/emergency-roofing", "utm_source": "v4_regression", "location_hint": "Brooklyn, NY" }
+}

@@ -1,0 +1,8 @@
+{
+  "source": "unsupported_source",
+  "source_event_id": null,
+  "received_at": "not-a-date",
+  "customer": { "name": "Invalid V4 Test", "email": "invalid.v4@example.com", "phone": null },
+  "message": { "subject": "Invalid", "body": null, "channel": "unsupported_channel" },
+  "metadata": { "page_url": null, "utm_source": "v4_regression", "location_hint": null }
+}

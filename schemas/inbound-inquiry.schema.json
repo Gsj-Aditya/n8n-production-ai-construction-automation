@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://summit-ridge.example/schemas/inbound-inquiry.schema.json",
+  "title": "Construction Inquiry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source", "source_event_id", "received_at", "customer", "message"],
+  "properties": {
+    "source": {
+      "type": "string",
+      "enum": ["website_form", "gmail", "manual_api", "phone_note", "partner_referral"]
+    },
+    "source_event_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "received_at": { "type": "string", "format": "date-time" },
+    "customer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "email", "phone"],
+      "properties": {
+        "name": { "type": ["string", "null"], "maxLength": 200 },
+        "email": { "type": ["string", "null"], "maxLength": 254 },
+        "phone": { "type": ["string", "null"], "maxLength": 32 }
+      }
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject", "body", "channel"],
+      "properties": {
+        "subject": { "type": ["string", "null"], "maxLength": 300 },
+        "body": { "type": "string", "minLength": 1, "maxLength": 10000 },
+        "channel": { "type": "string", "enum": ["form", "email", "api", "phone_note", "referral"] }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "page_url": { "type": ["string", "null"] },
+        "utm_source": { "type": ["string", "null"] },
+        "location_hint": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

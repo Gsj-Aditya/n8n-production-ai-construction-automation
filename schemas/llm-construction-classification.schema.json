@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://summit-ridge.example/schemas/llm-construction-classification.schema.json",
+  "title": "Construction Inquiry AI Classification",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "extracted_contact",
+    "project",
+    "classification",
+    "summary",
+    "missing_fields",
+    "signals"
+  ],
+  "properties": {
+    "extracted_contact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "email", "phone"],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "email": { "type": ["string", "null"] },
+        "phone": { "type": ["string", "null"] }
+      }
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "category",
+        "service_requested",
+        "property_type",
+        "city",
+        "state",
+        "timeline",
+        "budget_range",
+        "exact_budget_amount",
+        "currency"
+      ],
+      "properties": {
+        "category": {
+          "type": "string",
+          "enum": [
+            "emergency_repair",
+            "remodel",
+            "roofing",
+            "commercial",
+            "outdoor",
+            "general_question"
+          ]
+        },
+        "service_requested": { "type": "string" },
+        "property_type": {
+          "type": "string",
+          "enum": ["residential", "commercial", "unknown"]
+        },
+        "city": { "type": ["string", "null"] },
+        "state": { "type": ["string", "null"] },
+        "timeline": {
+          "type": "string",
+          "enum": [
+            "emergency",
+            "within_7_days",
+            "within_30_days",
+            "within_90_days",
+            "flexible",
+            "unknown"
+          ]
+        },
+        "budget_range": {
+          "type": "string",
+          "enum": ["under_5k", "5k_15k", "15k_50k", "50k_plus", "unknown"]
+        },
+        "exact_budget_amount": { "type": ["number", "null"] },
+        "currency": { "type": ["string", "null"] }
+      }
+    },
+    "classification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["urgency", "lead_quality", "confidence"],
+      "properties": {
+        "urgency": {
+          "type": "string",
+          "enum": ["emergency", "time_sensitive", "routine", "unknown"]
+        },
+        "lead_quality": {
+          "type": "string",
+          "enum": ["qualified", "needs_more_info", "not_a_fit", "spam"]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "summary": { "type": "string" },
+    "missing_fields": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "name",
+          "email",
+          "phone",
+          "service_requested",
+          "property_type",
+          "location",
+          "timeline",
+          "budget"
+        ]
+      }
+    },
+    "signals": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "safety_risk",
+          "active_damage",
+          "same_day_request",
+          "short_timeline",
+          "explicit_budget",
+          "commercial_project",
+          "detailed_scope",
+          "vague_request",
+          "spam_signal"
+        ]
+      }
+    }
+  }
+}

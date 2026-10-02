@@ -1,0 +1,28 @@
+{
+  "name": "construction_dead_letters_v4",
+  "description": "Unexpected V4 workflow failures preserved for investigation and controlled reprocessing.",
+  "columns": [
+    { "name": "dead_letter_id", "type": "string" },
+    { "name": "created_at", "type": "string" },
+    { "name": "status", "type": "string" },
+    { "name": "source_workflow_id", "type": "string" },
+    { "name": "source_workflow_name", "type": "string" },
+    { "name": "failed_execution_id", "type": "string" },
+    { "name": "failed_execution_url", "type": "string" },
+    { "name": "retry_of", "type": "string" },
+    { "name": "execution_mode", "type": "string" },
+    { "name": "failed_node", "type": "string" },
+    { "name": "error_message", "type": "string" },
+    { "name": "error_stack", "type": "string" },
+    { "name": "error_stage", "type": "string" },
+    { "name": "error_category", "type": "string" },
+    { "name": "correlation_id", "type": "string" },
+    { "name": "inquiry_id", "type": "string" },
+    { "name": "source_event_id", "type": "string" },
+    { "name": "original_payload_json", "type": "string" },
+    { "name": "attempt_count", "type": "number" },
+    { "name": "last_attempt_at", "type": "string" },
+    { "name": "resolved_at", "type": "string" },
+    { "name": "resolution_note", "type": "string" }
+  ]
+}

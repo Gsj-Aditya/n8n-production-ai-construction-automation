@@ -1,0 +1,2466 @@
+{
+  "name": "V4 - Construction Dead Letter Reprocessor",
+  "description": "Portfolio template: AI-enriched construction inquiry intake with idempotency, Groq classification, deterministic rules, HubSpot Contact/Deal synchronization, retries, fallbacks, and persistent audit status.",
+  "nodes": [
+    {
+      "id": "2444b2e8-f923-4b5d-a341-a69612001ed2",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "73363922-11a9-4340-9c66-3225da568a13",
+      "name": "Select Reprocessing Target",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// A human operator selects one reviewed dead-letter ID before manual execution.\n// This avoids an unauthenticated mutation webhook and prevents automatic bulk retry.\nconst TARGET_DEAD_LETTER_ID = 'CONFIGURE_DEAD_LETTER_ID';\n\nreturn [{\n  json: {\n    reprocessing_request: {\n      dead_letter_id: TARGET_DEAD_LETTER_ID,\n      requested_at: new Date().toISOString(),\n      requested_by: 'manual_operator',\n      dry_run: false,\n    },\n  },\n}];"
+      }
+    },
+    {
+      "id": "86577d29-b896-4aa7-947a-ebbb36b1851f",
+      "name": "Get Selected Dead Letter",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_dead_letters_v4"
+        },
+        "returnAll": false,
+        "limit": 1,
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "dead_letter_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.reprocessing_request.dead_letter_id }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9cc27197-6944-43fe-8244-0f60f8bbc96b",
+      "name": "Attach Reprocessing Dead Letter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const request = $('Select Reprocessing Target').first().json;\nreturn $input.all().map((item) => {\n  if (!item.json?.dead_letter_id) throw new Error(`Dead letter not found: ${request.reprocessing_request.dead_letter_id}`);\n  return { json: { ...request, dead_letter: item.json } };\n});"
+      }
+    },
+    {
+      "id": "92cd8ac7-76d1-4b16-9c84-7c178d09c38e",
+      "name": "Get Linked Inquiry",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        0
+      ],
+      "alwaysOutputData": true,
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "returnAll": false,
+        "limit": 1,
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "inquiry_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.dead_letter.inquiry_id }}"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "17554cf0-41fd-4f8f-b8f8-c40d5268509d",
+      "name": "Attach Reprocessing Inquiry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const context = $('Attach Reprocessing Dead Letter').first().json;\nreturn $input.all().map((item) => ({\n  json: {\n    ...context,\n    inquiry: item.json?.inquiry_id ? item.json : null,\n    inquiry_found: Boolean(item.json?.inquiry_id),\n  },\n}));"
+      }
+    },
+    {
+      "id": "9c873e08-a9f1-4287-9b05-f3dc14ef2dfd",
+      "name": "Validate Reprocessing Eligibility",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        0
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => {\n  const data = item.json;\n  const dlq = data.dead_letter;\n  const reasons = [];\n  const retryableCategories = new Set(['transient_network', 'rate_limit', 'provider_communication']);\n\n  if (dlq.status !== 'open') reasons.push('dead_letter_not_open');\n  if (Number(dlq.attempt_count ?? 0) >= 3) reasons.push('attempt_limit_reached');\n  if (!retryableCategories.has(dlq.error_category)) reasons.push('non_retryable_category');\n  if (!data.inquiry_found) reasons.push('inquiry_not_found');\n  if (!dlq.original_payload_json || dlq.original_payload_json === '{}') reasons.push('original_payload_missing');\n\n  let recoveryBoundary = 'manual_only';\n  if (reasons.length === 0) {\n    if (dlq.error_stage === 'communication') recoveryBoundary = 'communication_only';\n    else if (dlq.error_stage === 'followup') recoveryBoundary = 'followup_only';\n    else if (dlq.error_stage === 'crm') recoveryBoundary = 'crm_reconcile';\n    else reasons.push('unsupported_automatic_stage');\n  }\n\n  const approved = reasons.length === 0 && recoveryBoundary !== 'manual_only';\n  return { json: { ...data, recovery: {\n    decision: approved ? 'approved' : 'manual_only',\n    approved,\n    recovery_boundary: recoveryBoundary,\n    reasons,\n    dry_run: data.reprocessing_request.dry_run,\n    attempt_number: Number(dlq.attempt_count ?? 0) + 1,\n  } } };\n});"
+      }
+    },
+    {
+      "id": "d23071fa-b66d-4ab0-9490-700bf9ab97e2",
+      "name": "Route Reprocessing Decision",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "47f8e6cb-ad53-427c-9d6b-a797a221a1cc",
+                    "leftValue": "={{ $json.recovery.decision }}",
+                    "rightValue": "approved",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "approved"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      }
+    },
+    {
+      "id": "7afac787-49dd-42fb-8e3d-e408fc7d7dbc",
+      "name": "Prepare Approved Retry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: {\n  ...item.json,\n  recovery: {\n    ...item.json.recovery,\n    status: item.json.recovery.dry_run ? 'approved_dry_run' : 'ready_to_claim',\n  },\n} }));"
+      }
+    },
+    {
+      "id": "7976a2b4-5c9c-475d-9e4b-4531412d10f4",
+      "name": "Prepare Manual Review Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        96
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: {\n  status: 'manual_review_required',\n  dead_letter_id: item.json.dead_letter.dead_letter_id,\n  inquiry_id: item.json.dead_letter.inquiry_id || null,\n  error_stage: item.json.dead_letter.error_stage,\n  error_category: item.json.dead_letter.error_category,\n  recovery_boundary: item.json.recovery.recovery_boundary,\n  reasons: item.json.recovery.reasons,\n  message: 'No automatic retry was attempted. Fix or review the underlying condition first.',\n} }));"
+      }
+    },
+    {
+      "id": "71d6d5d1-e02e-49ff-a9b1-2dab61fb0184",
+      "name": "Route Live Recovery",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        2160,
+        -80
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "f03c0803-8ba4-4b12-a898-8e3d0a2897a7",
+                    "leftValue": "={{ $json.recovery.status }}",
+                    "rightValue": "ready_to_claim",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "ready_to_claim"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      }
+    },
+    {
+      "id": "4114cded-6bca-4713-8fd0-36cf64d0ecdc",
+      "name": "Prepare Dry Run Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        96
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: {\n  status: 'approved_dry_run',\n  dead_letter_id: item.json.dead_letter.dead_letter_id,\n  inquiry_id: item.json.dead_letter.inquiry_id,\n  recovery_boundary: item.json.recovery.recovery_boundary,\n  attempt_number: item.json.recovery.attempt_number,\n  message: 'Safety checks passed. No record was claimed and no provider action was attempted.',\n} }));"
+      }
+    },
+    {
+      "id": "c833123a-9960-4cba-9fba-17daa03512f6",
+      "name": "Prepare Retry Claim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: {\n  ...item.json,\n  claim: {\n    previous_attempt_count: Number(item.json.dead_letter.attempt_count ?? 0),\n    attempt_count: Number(item.json.dead_letter.attempt_count ?? 0) + 1,\n    claimed_at: new Date().toISOString(),\n    status: 'retrying',\n  },\n} }));"
+      }
+    },
+    {
+      "id": "0c5672e7-f102-4189-bb72-f2b3fbb1c08a",
+      "name": "Claim Dead Letter",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2640,
+        -80
+      ],
+      "alwaysOutputData": true,
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_dead_letters_v4"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "dead_letter_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.dead_letter.dead_letter_id }}"
+            },
+            {
+              "keyName": "status",
+              "condition": "eq",
+              "keyValue": "open"
+            },
+            {
+              "keyName": "attempt_count",
+              "condition": "eq",
+              "keyValue": "={{ $json.claim.previous_attempt_count }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "retrying",
+            "attempt_count": "={{ $json.claim.attempt_count }}",
+            "last_attempt_at": "={{ $json.claim.claimed_at }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "dead_letter_id",
+              "displayName": "dead_letter_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_workflow_id",
+              "displayName": "source_workflow_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_workflow_name",
+              "displayName": "source_workflow_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "failed_execution_id",
+              "displayName": "failed_execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "failed_execution_url",
+              "displayName": "failed_execution_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "retry_of",
+              "displayName": "retry_of",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "execution_mode",
+              "displayName": "execution_mode",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "failed_node",
+              "displayName": "failed_node",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_message",
+              "displayName": "error_message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_stack",
+              "displayName": "error_stack",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_stage",
+              "displayName": "error_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_category",
+              "displayName": "error_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "correlation_id",
+              "displayName": "correlation_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "inquiry_id",
+              "displayName": "inquiry_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_event_id",
+              "displayName": "source_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "original_payload_json",
+              "displayName": "original_payload_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "attempt_count",
+              "displayName": "attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_attempt_at",
+              "displayName": "last_attempt_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "resolved_at",
+              "displayName": "resolved_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "resolution_note",
+              "displayName": "resolution_note",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "66f71797-cc80-4b59-b629-0fc69875214f",
+      "name": "Restore Retry Claim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "const originals = $('Prepare Retry Claim').all();\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing retry-claim context ${index}`);\n  const acquired = item.json?.dead_letter_id === original.dead_letter.dead_letter_id;\n  return { json: { ...original, claim: { ...original.claim,\n    acquired,\n    result: acquired ? 'acquired' : 'conflict',\n  } } };\n});"
+      }
+    },
+    {
+      "id": "40a4a414-aca0-44cf-8983-70fdfcf084fa",
+      "name": "Route Claim Result",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        3120,
+        -80
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "9e82363b-e738-40d8-9995-f1226af2f3da",
+                    "leftValue": "={{ $json.claim.result }}",
+                    "rightValue": "acquired",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "acquired"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      }
+    },
+    {
+      "id": "499f68ac-73bd-4000-8f23-eb71c2e95080",
+      "name": "Prepare Claim Conflict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        96
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: {\n  status: 'claim_conflict',\n  dead_letter_id: item.json.dead_letter.dead_letter_id,\n  message: 'The dead letter was already claimed or changed. No provider action was attempted.',\n} }));"
+      }
+    },
+    {
+      "id": "95baa44e-66fc-48ab-a9c8-22d8bb5bb7b5",
+      "name": "Mark Inquiry Retrying",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3360,
+        -80
+      ],
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "inquiry_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.dead_letter.inquiry_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "reprocessing_status": "retrying",
+            "reprocessing_attempt_count": "={{ $json.claim.attempt_count }}",
+            "last_reprocessed_at": "={{ $json.claim.claimed_at }}",
+            "processing_stage": "reprocessing"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "dedup_key",
+              "displayName": "dedup_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "inquiry_id",
+              "displayName": "inquiry_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_event_id",
+              "displayName": "source_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "disposition",
+              "displayName": "disposition",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "received_at",
+              "displayName": "received_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "stored_at",
+              "displayName": "stored_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "payload_json",
+              "displayName": "payload_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "automation_status",
+              "displayName": "automation_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_status",
+              "displayName": "ai_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_result_json",
+              "displayName": "ai_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_contact_id",
+              "displayName": "hubspot_contact_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_deal_id",
+              "displayName": "hubspot_deal_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_error",
+              "displayName": "last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "completed_at",
+              "displayName": "completed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "result_json",
+              "displayName": "result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_status",
+              "displayName": "ack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_message_type",
+              "displayName": "ack_message_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_sent_at",
+              "displayName": "ack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_status",
+              "displayName": "slack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_sent_at",
+              "displayName": "slack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_status",
+              "displayName": "followup_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_due_at",
+              "displayName": "followup_due_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_sent_at",
+              "displayName": "followup_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_last_error",
+              "displayName": "communication_last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_result_json",
+              "displayName": "communication_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "correlation_id",
+              "displayName": "correlation_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "execution_id",
+              "displayName": "execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_stage",
+              "displayName": "processing_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_started_at",
+              "displayName": "processing_started_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_finished_at",
+              "displayName": "processing_finished_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_duration_ms",
+              "displayName": "processing_duration_ms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_successful_stage",
+              "displayName": "last_successful_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_stage",
+              "displayName": "error_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_category",
+              "displayName": "error_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "dead_letter_id",
+              "displayName": "dead_letter_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_status",
+              "displayName": "reprocessing_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_attempt_count",
+              "displayName": "reprocessing_attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_reprocessed_at",
+              "displayName": "last_reprocessed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "86fbfe91-f429-4849-9a72-0fda2b9609bd",
+      "name": "Restore Inquiry Claim",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "const originals = $('Restore Retry Claim').all();\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing claimed recovery context ${index}`);\n  return { json: { ...original, inquiry_claim_persisted: !item.json.error } };\n});"
+      }
+    },
+    {
+      "id": "c700fd56-dd65-41f8-8508-72222a3e8263",
+      "name": "Prepare Recovery Action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "const TEST_EMAIL = 'YOUR_CONTROLLED_TEST_EMAIL@example.com';\nreturn $input.all().map((item) => {\n  const data = item.json;\n  const node = data.dead_letter.failed_node ?? '';\n  const stage = data.dead_letter.error_stage;\n  const payload = JSON.parse(data.dead_letter.original_payload_json || '{}');\n  let action = 'manual_only';\n  if (/slack/i.test(node)) action = 'slack_only';\n  else if (/gmail|email/i.test(node)) action = 'gmail_only';\n  else if (stage === 'crm') action = 'crm_reconcile';\n  else if (stage === 'followup') action = 'followup_recheck';\n\n  const customer = payload.customer ?? {};\n  const slackText = [\n    '*Recovered V4 construction inquiry alert*',\n    `Inquiry: ${data.dead_letter.inquiry_id}`,\n    `Correlation: ${data.dead_letter.correlation_id}`,\n    `Customer: ${customer.name ?? 'Unknown'} (${customer.email ?? customer.phone ?? 'no contact method'})`,\n    `Original failed execution: ${data.dead_letter.failed_execution_id}`,\n    `Dead letter: ${data.dead_letter.dead_letter_id}`,\n    `Recovery attempt: ${data.claim.attempt_count}`,\n  ].join('\\n');\n\n  return { json: { ...data, recovery_action: {\n    action,\n    slack: { channel_id: 'CONFIGURE_SLACK_CHANNEL_ID', text: slackText },\n    gmail: {\n      to: TEST_EMAIL,\n      subject: `Recovered inquiry acknowledgment: ${data.dead_letter.inquiry_id}`,\n      body: `This is a controlled recovery message for ${customer.name ?? 'the customer'} and inquiry ${data.dead_letter.inquiry_id}. Original intended recipient: ${customer.email ?? 'unavailable'}.`,\n    },\n    crm_search: {\n      filterGroups: [{ filters: [{ propertyName: 'construction_inquiry_id', operator: 'EQ', value: data.dead_letter.inquiry_id }] }],\n      properties: ['dealname','dealstage','pipeline','construction_inquiry_id'],\n      limit: 2,\n    },\n    followup_deal_id: data.inquiry?.hubspot_deal_id || null,\n  } } };\n});"
+      }
+    },
+    {
+      "id": "844f802e-a1ae-4204-ac92-b46bfd9d9a8b",
+      "name": "Route Recovery Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        4080,
+        -80
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "fb5449ba-d758-42df-a40f-37eedcc5b84c",
+                    "leftValue": "={{ $json.recovery_action.action }}",
+                    "rightValue": "slack_only",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "slack_only"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "b5ab5325-d899-4b6c-b855-e673e129bfed",
+                    "leftValue": "={{ $json.recovery_action.action }}",
+                    "rightValue": "gmail_only",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "gmail_only"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "d9584c3a-03ee-4351-ab20-87785ad28614",
+                    "leftValue": "={{ $json.recovery_action.action }}",
+                    "rightValue": "crm_reconcile",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "crm_reconcile"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "0a6ed317-5ca0-443b-8cda-738387e2ea1c",
+                    "leftValue": "={{ $json.recovery_action.action }}",
+                    "rightValue": "followup_recheck",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "followup_recheck"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      }
+    },
+    {
+      "id": "8647d730-1fea-4d96-86b9-c1e70c55ec66",
+      "name": "Retry Slack Only",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.5,
+      "position": [
+        4320,
+        -240
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "CONFIGURE_SLACK_CHANNEL_ID",
+          "mode": "id"
+        },
+        "text": "={{ $json.recovery_action.slack.text }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "CONFIGURE_SLACKAPI",
+          "name": "CONFIGURE: Slack API"
+        }
+      }
+    },
+    {
+      "id": "dd0a0d2e-562d-4f5c-b744-0a53b0b5c0e8",
+      "name": "Retry Gmail Only",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        4320,
+        -80
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "sendTo": "={{ $json.recovery_action.gmail.to }}",
+        "subject": "={{ $json.recovery_action.gmail.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.recovery_action.gmail.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "CONFIGURE_GMAILOAUTH2",
+          "name": "CONFIGURE: Gmail OAuth2"
+        }
+      }
+    },
+    {
+      "id": "7200d836-5192-4319-ae70-b64aa553e0a0",
+      "name": "Reconcile HubSpot Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        4320,
+        80
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/deals/search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotAppToken",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.recovery_action.crm_search }}",
+        "options": {}
+      },
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "CONFIGURE_HUBSPOTAPPTOKEN",
+          "name": "CONFIGURE: HubSpot Service Key"
+        }
+      }
+    },
+    {
+      "id": "40ca7f8a-fec7-4783-b5ba-33ebb64b7f21",
+      "name": "Recheck Follow-Up Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        4320,
+        240
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "GET",
+        "url": "={{ 'https://api.hubapi.com/crm/v3/objects/deals/' + $json.recovery_action.followup_deal_id + '?properties=dealstage,pipeline' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotAppToken",
+        "options": {}
+      },
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "CONFIGURE_HUBSPOTAPPTOKEN",
+          "name": "CONFIGURE: HubSpot Service Key"
+        }
+      }
+    },
+    {
+      "id": "b93e7fe4-c47f-42b4-81de-4bff1f900a9f",
+      "name": "Prepare Manual Recovery Action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        400
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: { ...item.json, recovery_result: {\n  action: item.json.recovery_action.action,\n  outcome: 'manual_review',\n  note: 'No implemented automatic action for this recovery boundary',\n  provider_message_id: '',\n  completed_at: new Date().toISOString(),\n} } }));"
+      }
+    },
+    {
+      "id": "d986a766-f472-43fc-ae92-94c50697fd3d",
+      "name": "Normalize Recovery Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "const originals = $('Prepare Recovery Action').all();\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing recovery-action context ${index}`);\n  const action = original.recovery_action.action;\n  const error = item.json.error?.message ?? item.json.error ?? null;\n  let outcome = error ? 'retry_failed' : 'resolved';\n  let note = error ? String(error) : `${action} completed successfully`;\n\n  if (action === 'slack_only' && item.json.ok === false) {\n    outcome = 'retry_failed'; note = String(item.json.error ?? 'Slack returned an unsuccessful response');\n  }\n  if (action === 'crm_reconcile' && !error) {\n    const results = Array.isArray(item.json.results) ? item.json.results : [];\n    if (results.length === 1) note = `Existing HubSpot Deal ${results[0].id} confirmed; no create repeated`;\n    else { outcome = 'manual_review'; note = results.length === 0 ? 'No existing Deal found; creation requires reviewed recovery' : 'Multiple Deals found; manual reconciliation required'; }\n  }\n  if (action === 'followup_recheck' && !error) {\n    const stage = item.json.properties?.dealstage ?? null;\n    if (!stage) { outcome = 'manual_review'; note = 'Follow-up Deal stage unavailable'; }\n    else if (stage === 'appointmentscheduled') { outcome = 'manual_review'; note = 'Deal remains New Inquiry; reviewed follow-up send is required'; }\n    else note = `Follow-up suppressed because Deal stage is ${stage}`;\n  }\n\n  return { json: { ...original, recovery_result: {\n    action, outcome, note,\n    provider_message_id: String(item.json.ts ?? item.json.message?.ts ?? item.json.id ?? ''),\n    completed_at: new Date().toISOString(),\n  } } };\n});"
+      }
+    },
+    {
+      "id": "2f056967-33e6-44b7-b386-4aa7fb9581cf",
+      "name": "Prepare Recovery Persistence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4800,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => {\n  const data = item.json;\n  const result = data.recovery_result;\n  const attempts = data.claim.attempt_count;\n  let deadLetterStatus = 'open';\n  let inquiryStatus = 'pending_review';\n  if (result.outcome === 'resolved') { deadLetterStatus = 'resolved'; inquiryStatus = 'resolved'; }\n  else if (result.outcome === 'manual_review') { deadLetterStatus = 'manual_review'; inquiryStatus = 'manual_review'; }\n  else if (attempts >= 3) { deadLetterStatus = 'manual_review'; inquiryStatus = 'attempt_limit_reached'; }\n\n  return { json: { ...data, recovery_persistence: {\n    dead_letter_status: deadLetterStatus,\n    inquiry_status: inquiryStatus,\n    attempt_count: attempts,\n    last_attempt_at: data.claim.claimed_at,\n    resolved_at: result.outcome === 'resolved' ? result.completed_at : '',\n    resolution_note: result.note,\n    processing_stage: result.outcome === 'resolved' ? 'reprocessing_resolved' : 'reprocessing_attention_required',\n  } } };\n});"
+      }
+    },
+    {
+      "id": "bd26353a-c363-4cc1-a7f5-f950c6f200c9",
+      "name": "Finalize Dead Letter",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        5040,
+        -80
+      ],
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_dead_letters_v4"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "dead_letter_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.dead_letter.dead_letter_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "={{ $json.recovery_persistence.dead_letter_status }}",
+            "attempt_count": "={{ $json.recovery_persistence.attempt_count }}",
+            "last_attempt_at": "={{ $json.recovery_persistence.last_attempt_at }}",
+            "resolved_at": "={{ $json.recovery_persistence.resolved_at }}",
+            "resolution_note": "={{ $json.recovery_persistence.resolution_note }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "dead_letter_id",
+              "displayName": "dead_letter_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "created_at",
+              "displayName": "created_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_workflow_id",
+              "displayName": "source_workflow_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_workflow_name",
+              "displayName": "source_workflow_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "failed_execution_id",
+              "displayName": "failed_execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "failed_execution_url",
+              "displayName": "failed_execution_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "retry_of",
+              "displayName": "retry_of",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "execution_mode",
+              "displayName": "execution_mode",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "failed_node",
+              "displayName": "failed_node",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_message",
+              "displayName": "error_message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_stack",
+              "displayName": "error_stack",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_stage",
+              "displayName": "error_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_category",
+              "displayName": "error_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "correlation_id",
+              "displayName": "correlation_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "inquiry_id",
+              "displayName": "inquiry_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_event_id",
+              "displayName": "source_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "original_payload_json",
+              "displayName": "original_payload_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "attempt_count",
+              "displayName": "attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_attempt_at",
+              "displayName": "last_attempt_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "resolved_at",
+              "displayName": "resolved_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "resolution_note",
+              "displayName": "resolution_note",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "da92a7f3-ba59-4d22-8e39-105f3ba00a4c",
+      "name": "Restore After Dead Letter Resolution",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5280,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "const originals = $('Prepare Recovery Persistence').all();\nreturn $input.all().map((item, index) => ({ json: {\n  ...originals[index].json,\n  dead_letter_persistence_ok: !item.json.error,\n} }));"
+      }
+    },
+    {
+      "id": "de6a05db-7449-4f2f-863b-f607e846cfdf",
+      "name": "Finalize Inquiry Recovery",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        5520,
+        -80
+      ],
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "inquiry_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.dead_letter.inquiry_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "reprocessing_status": "={{ $json.recovery_persistence.inquiry_status }}",
+            "reprocessing_attempt_count": "={{ $json.recovery_persistence.attempt_count }}",
+            "last_reprocessed_at": "={{ $json.recovery_persistence.last_attempt_at }}",
+            "processing_stage": "={{ $json.recovery_persistence.processing_stage }}",
+            "last_error": "={{ $json.recovery_result.outcome === \"resolved\" ? \"\" : $json.recovery_result.note }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "dedup_key",
+              "displayName": "dedup_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "inquiry_id",
+              "displayName": "inquiry_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_event_id",
+              "displayName": "source_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "disposition",
+              "displayName": "disposition",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "received_at",
+              "displayName": "received_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "stored_at",
+              "displayName": "stored_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "payload_json",
+              "displayName": "payload_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "automation_status",
+              "displayName": "automation_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_status",
+              "displayName": "ai_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_result_json",
+              "displayName": "ai_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_contact_id",
+              "displayName": "hubspot_contact_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_deal_id",
+              "displayName": "hubspot_deal_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_error",
+              "displayName": "last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "completed_at",
+              "displayName": "completed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "result_json",
+              "displayName": "result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_status",
+              "displayName": "ack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_message_type",
+              "displayName": "ack_message_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_sent_at",
+              "displayName": "ack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_status",
+              "displayName": "slack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_sent_at",
+              "displayName": "slack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_status",
+              "displayName": "followup_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_due_at",
+              "displayName": "followup_due_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_sent_at",
+              "displayName": "followup_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_last_error",
+              "displayName": "communication_last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_result_json",
+              "displayName": "communication_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "correlation_id",
+              "displayName": "correlation_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "execution_id",
+              "displayName": "execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_stage",
+              "displayName": "processing_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_started_at",
+              "displayName": "processing_started_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_finished_at",
+              "displayName": "processing_finished_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_duration_ms",
+              "displayName": "processing_duration_ms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_successful_stage",
+              "displayName": "last_successful_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_stage",
+              "displayName": "error_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_category",
+              "displayName": "error_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "dead_letter_id",
+              "displayName": "dead_letter_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_status",
+              "displayName": "reprocessing_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_attempt_count",
+              "displayName": "reprocessing_attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_reprocessed_at",
+              "displayName": "last_reprocessed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "d339e4cf-dbdd-4e13-8998-9c0ff4e2fa65",
+      "name": "Restore After Inquiry Resolution",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5760,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "const originals = $('Restore After Dead Letter Resolution').all();\nreturn $input.all().map((item, index) => ({ json: {\n  ...originals[index].json,\n  inquiry_persistence_ok: !item.json.error,\n} }));"
+      }
+    },
+    {
+      "id": "473fa796-27c2-410d-a666-d7fa4775de8b",
+      "name": "Prepare Reprocessing Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6000,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: {\n  status: item.json.recovery_persistence.inquiry_status,\n  dead_letter_id: item.json.dead_letter.dead_letter_id,\n  inquiry_id: item.json.dead_letter.inquiry_id,\n  recovery_action: item.json.recovery_result.action,\n  recovery_outcome: item.json.recovery_result.outcome,\n  attempt_count: item.json.recovery_persistence.attempt_count,\n  note: item.json.recovery_result.note,\n  provider_message_id: item.json.recovery_result.provider_message_id || null,\n} }));"
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Select Reprocessing Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Select Reprocessing Target": {
+      "main": [
+        [
+          {
+            "node": "Get Selected Dead Letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Selected Dead Letter": {
+      "main": [
+        [
+          {
+            "node": "Attach Reprocessing Dead Letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Reprocessing Dead Letter": {
+      "main": [
+        [
+          {
+            "node": "Get Linked Inquiry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Linked Inquiry": {
+      "main": [
+        [
+          {
+            "node": "Attach Reprocessing Inquiry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Reprocessing Inquiry": {
+      "main": [
+        [
+          {
+            "node": "Validate Reprocessing Eligibility",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Reprocessing Eligibility": {
+      "main": [
+        [
+          {
+            "node": "Route Reprocessing Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Reprocessing Decision": {
+      "main": [
+        [
+          {
+            "node": "Prepare Approved Retry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Manual Review Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Approved Retry": {
+      "main": [
+        [
+          {
+            "node": "Route Live Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Live Recovery": {
+      "main": [
+        [
+          {
+            "node": "Prepare Retry Claim",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Dry Run Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Retry Claim": {
+      "main": [
+        [
+          {
+            "node": "Claim Dead Letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Dead Letter": {
+      "main": [
+        [
+          {
+            "node": "Restore Retry Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Retry Claim": {
+      "main": [
+        [
+          {
+            "node": "Route Claim Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Claim Result": {
+      "main": [
+        [
+          {
+            "node": "Mark Inquiry Retrying",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Claim Conflict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Inquiry Retrying": {
+      "main": [
+        [
+          {
+            "node": "Restore Inquiry Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Inquiry Claim": {
+      "main": [
+        [
+          {
+            "node": "Prepare Recovery Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Recovery Action": {
+      "main": [
+        [
+          {
+            "node": "Route Recovery Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Recovery Action": {
+      "main": [
+        [
+          {
+            "node": "Retry Slack Only",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retry Gmail Only",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reconcile HubSpot Deal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Recheck Follow-Up Deal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Manual Recovery Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry Slack Only": {
+      "main": [
+        [
+          {
+            "node": "Normalize Recovery Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry Gmail Only": {
+      "main": [
+        [
+          {
+            "node": "Normalize Recovery Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reconcile HubSpot Deal": {
+      "main": [
+        [
+          {
+            "node": "Normalize Recovery Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recheck Follow-Up Deal": {
+      "main": [
+        [
+          {
+            "node": "Normalize Recovery Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Manual Recovery Action": {
+      "main": [
+        [
+          {
+            "node": "Prepare Recovery Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Recovery Result": {
+      "main": [
+        [
+          {
+            "node": "Prepare Recovery Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Recovery Persistence": {
+      "main": [
+        [
+          {
+            "node": "Finalize Dead Letter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Dead Letter": {
+      "main": [
+        [
+          {
+            "node": "Restore After Dead Letter Resolution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore After Dead Letter Resolution": {
+      "main": [
+        [
+          {
+            "node": "Finalize Inquiry Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Inquiry Recovery": {
+      "main": [
+        [
+          {
+            "node": "Restore After Inquiry Resolution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore After Inquiry Resolution": {
+      "main": [
+        [
+          {
+            "node": "Prepare Reprocessing Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {},
+  "active": false,
+  "tags": [],
+  "isArchived": false,
+  "nodeGroups": [],
+  "sourceWorkflowId": null
+}

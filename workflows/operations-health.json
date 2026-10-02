@@ -1,0 +1,696 @@
+{
+  "name": "V4 - Construction Operations Health",
+  "description": "Portfolio template: AI-enriched construction inquiry intake with idempotency, Groq classification, deterministic rules, HubSpot Contact/Deal synchronization, retries, fallbacks, and persistent audit status.",
+  "nodes": [
+    {
+      "id": "9ed992fe-0815-481d-b8a0-65b20f76c987",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "32154454-3cd1-4d30-98ef-8247231078e1",
+      "name": "Get V4 Inquiries",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        0
+      ],
+      "alwaysOutputData": true,
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "returnAll": true,
+        "matchType": "anyCondition",
+        "filters": {
+          "conditions": []
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "38e468fd-1255-416c-ad43-03979a956d9d",
+      "name": "Collect Inquiry Snapshot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const rows = $input.all().map((item) => item.json).filter((row) => row?.inquiry_id);\nreturn [{ json: { inquiry_snapshot: rows, collected_at: new Date().toISOString() } }];"
+      }
+    },
+    {
+      "id": "7f3155a3-c79c-40b4-8f8a-82beec4a707f",
+      "name": "Get V4 Dead Letters",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        720,
+        0
+      ],
+      "alwaysOutputData": true,
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_dead_letters_v4"
+        },
+        "returnAll": true,
+        "matchType": "anyCondition",
+        "filters": {
+          "conditions": []
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "bde4058b-7307-405c-82c8-043ea782a80f",
+      "name": "Build Operations Dashboard",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const inquiryContext = $('Collect Inquiry Snapshot').first().json;\nconst inquiries = inquiryContext.inquiry_snapshot ?? [];\nconst deadLetters = $input.all().map((item) => item.json).filter((row) => row?.dead_letter_id);\nconst now = Date.now();\nconst countBy = (rows, field) => rows.reduce((acc, row) => {\n  const key = row[field] || 'empty';\n  acc[key] = (acc[key] || 0) + 1;\n  return acc;\n}, {});\n\nconst providerFailures = inquiries.filter((row) =>\n  row.ack_status === 'failed' || row.slack_status === 'failed' || row.followup_status === 'failed');\nconst overdueFollowups = inquiries.filter((row) =>\n  row.followup_status === 'scheduled' && row.followup_due_at && Date.parse(row.followup_due_at) < now);\nconst slowExecutions = inquiries.filter((row) => Number(row.processing_duration_ms || 0) > 10000);\nconst recoveryBacklog = inquiries.filter((row) =>\n  ['pending_review', 'retrying', 'manual_review', 'attempt_limit_reached'].includes(row.reprocessing_status));\nconst unresolvedDeadLetters = deadLetters.filter((row) =>\n  ['open', 'retrying', 'manual_review'].includes(row.status));\nconst stuckInquiries = inquiries.filter((row) => {\n  if (!['intake_stored', 'reprocessing'].includes(row.processing_stage)) return false;\n  const started = Date.parse(row.processing_started_at || row.stored_at || '');\n  return Number.isFinite(started) && now - started > 15 * 60 * 1000;\n});\nconst inquiryIds = new Set(inquiries.map((row) => row.inquiry_id));\nconst orphanDeadLetters = deadLetters.filter((row) => row.inquiry_id && !inquiryIds.has(row.inquiry_id));\n\nconst inquiryAttention = inquiries\n  .filter((row) => row.processing_stage === 'unexpected_error' ||\n    row.error_stage || providerFailures.includes(row) || overdueFollowups.includes(row) || recoveryBacklog.includes(row))\n  .map((row) => ({\n    type: 'inquiry', inquiry_id: row.inquiry_id, correlation_id: row.correlation_id,\n    processing_stage: row.processing_stage, error_stage: row.error_stage || null,\n    error_category: row.error_category || null, dead_letter_id: row.dead_letter_id || null,\n    reprocessing_status: row.reprocessing_status,\n    recommended_action: row.reprocessing_status === 'resolved' ? 'review_and_close_evidence' : 'investigate_inquiry',\n  }));\nconst deadLetterAttention = unresolvedDeadLetters.map((row) => ({\n  type: 'dead_letter', inquiry_id: row.inquiry_id || null, correlation_id: row.correlation_id || null,\n  processing_stage: row.error_stage, error_stage: row.error_stage,\n  error_category: row.error_category, dead_letter_id: row.dead_letter_id,\n  reprocessing_status: row.status,\n  recommended_action: row.status === 'open' ? 'review_retry_eligibility' : 'manual_resolution',\n}));\n\nlet health = 'healthy';\nconst healthReasons = [];\nif (providerFailures.length) healthReasons.push('provider_failures');\nif (overdueFollowups.length) healthReasons.push('overdue_followups');\nif (recoveryBacklog.length) healthReasons.push('recovery_backlog');\nif (unresolvedDeadLetters.length) healthReasons.push('unresolved_dead_letters');\nif (stuckInquiries.length) healthReasons.push('stuck_inquiries_over_15m');\nif (orphanDeadLetters.length) healthReasons.push('orphan_dead_letters');\nif (healthReasons.length) health = 'degraded';\nif (recoveryBacklog.some((row) => row.reprocessing_status === 'attempt_limit_reached') ||\n    unresolvedDeadLetters.some((row) => row.status === 'manual_review')) {\n  health = 'critical';\n  healthReasons.push('manual_intervention_required');\n}\n\nreturn [{ json: {\n  generated_at: new Date().toISOString(),\n  health,\n  health_reasons: [...new Set(healthReasons)],\n  summary: {\n    total_inquiries: inquiries.length,\n    total_dead_letters: deadLetters.length,\n    provider_failures: providerFailures.length,\n    overdue_followups: overdueFollowups.length,\n    slow_executions_over_10s: slowExecutions.length,\n    recovery_backlog: recoveryBacklog.length,\n    unresolved_dead_letters: unresolvedDeadLetters.length,\n    stuck_inquiries_over_15m: stuckInquiries.length,\n    orphan_dead_letters: orphanDeadLetters.length,\n  },\n  breakdowns: {\n    automation_status: countBy(inquiries, 'automation_status'),\n    processing_stage: countBy(inquiries, 'processing_stage'),\n    acknowledgment_status: countBy(inquiries, 'ack_status'),\n    slack_status: countBy(inquiries, 'slack_status'),\n    followup_status: countBy(inquiries, 'followup_status'),\n    reprocessing_status: countBy(inquiries, 'reprocessing_status'),\n    dead_letter_status: countBy(deadLetters, 'status'),\n    error_category: countBy(deadLetters, 'error_category'),\n  },\n  attention_items: [...inquiryAttention, ...deadLetterAttention],\n} }];"
+      }
+    },
+    {
+      "id": "8b310b55-dc0a-4f5d-add2-e597185a8a65",
+      "name": "Prepare Health Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const ALERT_MODE = 'live';\nreturn $input.all().map((item) => {\n  const dashboard = item.json;\n  const reasons = dashboard.health_reasons ?? [];\n  const affectedIds = [...new Set(\n    dashboard.attention_items.map((x) => x.dead_letter_id || x.correlation_id || x.inquiry_id).filter(Boolean),\n  )].sort();\n  const fingerprintParts = [dashboard.health, ...reasons.sort(), ...affectedIds];\n  const fingerprint = fingerprintParts.join('|');\n  const action = dashboard.health === 'healthy' ? 'no_alert' : ALERT_MODE === 'live' ? 'send' : 'preview';\n  const attention = dashboard.attention_items.slice(0, 5).map((x) =>\n    `• ${x.type}: ${x.inquiry_id || 'unlinked'} | ${x.error_category || x.processing_stage} | ${x.recommended_action}`);\n  const text = [\n    `*V4 operations health: ${dashboard.health.toUpperCase()}*`,\n    `Reasons: ${reasons.join(', ') || 'none'}`,\n    `Inquiries: ${dashboard.summary.total_inquiries}`,\n    `Unresolved dead letters: ${dashboard.summary.unresolved_dead_letters}`,\n    `Recovery backlog: ${dashboard.summary.recovery_backlog}`,\n    `Stuck >15m: ${dashboard.summary.stuck_inquiries_over_15m}`,\n    `Overdue follow-ups: ${dashboard.summary.overdue_followups}`,\n    ...attention,\n    dashboard.attention_items.length > 5 ? `…and ${dashboard.attention_items.length - 5} more attention item(s)` : null,\n  ].filter(Boolean).join('\\n');\n  return { json: { ...dashboard, operational_alert: {\n    mode: ALERT_MODE, action, severity: dashboard.health,\n    fingerprint, text, prepared_at: new Date().toISOString(),\n  } } };\n});"
+      }
+    },
+    {
+      "id": "28018044-9f96-43a7-86b6-e02c310580e4",
+      "name": "Route Health Alert",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        2160,
+        0
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "f768b070-f8cc-441b-9fb7-85e500b27def",
+                    "leftValue": "={{ $json.alert_decision.action }}",
+                    "rightValue": "send",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "send"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      }
+    },
+    {
+      "id": "de16ba2e-f3ef-458e-a71a-313be11e72a7",
+      "name": "Send Operations Slack Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.5,
+      "position": [
+        2400,
+        -80
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "CONFIGURE_SLACK_CHANNEL_ID",
+          "mode": "id"
+        },
+        "text": "={{ $json.alert_decision.text }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "CONFIGURE_SLACKAPI",
+          "name": "CONFIGURE: Slack API"
+        }
+      }
+    },
+    {
+      "id": "cbaed2ee-3903-48e2-b473-358c77b91468",
+      "name": "Get Operations Alert State",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1440,
+        0
+      ],
+      "alwaysOutputData": true,
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_alert_state_v4"
+        },
+        "returnAll": false,
+        "limit": 1,
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "alert_key",
+              "condition": "eq",
+              "keyValue": "v4_operations_health"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9d2c5d3a-4e2e-43bc-bd15-f81b300d6198",
+      "name": "Attach Alert State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const dashboard = $('Prepare Health Alert').first().json;\nreturn $input.all().map((item) => ({ json: {\n  ...dashboard,\n  previous_alert_state: item.json?.alert_key ? item.json : null,\n} }));"
+      }
+    },
+    {
+      "id": "ad008574-f41e-448d-b144-1586f7005745",
+      "name": "Decide Alert Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const COOLDOWN_MINUTES = 60;\nreturn $input.all().map((item) => {\n  const data = item.json;\n  const current = data.operational_alert;\n  const previous = data.previous_alert_state;\n  const now = Date.now();\n  let decision = 'suppress';\n  let reason = 'healthy_no_open_incident';\n\n  if (data.health === 'healthy') {\n    if (previous?.status === 'open') { decision = 'send'; reason = 'incident_recovered'; }\n  } else if (!previous || previous.status === 'resolved') {\n    decision = 'send'; reason = 'new_incident';\n  } else if (previous.fingerprint !== current.fingerprint) {\n    decision = 'send'; reason = 'incident_changed';\n  } else if (!previous.cooldown_until || Date.parse(previous.cooldown_until) <= now) {\n    decision = 'send'; reason = 'cooldown_reminder';\n  } else {\n    reason = 'duplicate_during_cooldown';\n  }\n\n  let text = current.text;\n  if (reason === 'incident_recovered') {\n    text = `*V4 operations health: RECOVERED*\\nPrevious incident is no longer active.\\nPrevious severity: ${previous.severity}\\nNotifications sent: ${previous.notification_count}`;\n  }\n  return { json: { ...data, alert_decision: {\n    action: decision,\n    reason,\n    decided_at: new Date().toISOString(),\n    cooldown_minutes: COOLDOWN_MINUTES,\n    text,\n  } } };\n});"
+      }
+    },
+    {
+      "id": "1a84bb19-cf7f-4184-a525-c0e6f451aa16",
+      "name": "Normalize Health Alert Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "const originals = $('Decide Alert Notification').all();\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing alert-decision context ${index}`);\n  const failed = Boolean(item.json.error) || item.json.ok === false;\n  return { json: { ...original, alert_delivery: {\n    attempted: true,\n    status: failed ? 'failed' : 'sent',\n    provider_message_id: failed ? '' : String(item.json.ts ?? item.json.message?.ts ?? ''),\n    error: failed ? (item.json.error?.message ?? item.json.error ?? 'Slack alert failed') : '',\n    completed_at: new Date().toISOString(),\n  } } };\n});"
+      }
+    },
+    {
+      "id": "f521ff49-1a9a-4805-843a-47c3ddc583b0",
+      "name": "Mark Alert Suppressed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        96
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: { ...item.json, alert_delivery: {\n  attempted: false,\n  status: 'suppressed',\n  provider_message_id: '',\n  error: '',\n  completed_at: new Date().toISOString(),\n} } }));"
+      }
+    },
+    {
+      "id": "566ef3b1-d789-4fac-8088-433b01c85cf7",
+      "name": "Prepare Alert State Persistence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2880,
+        0
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => {\n  const data = item.json;\n  const previous = data.previous_alert_state;\n  const decision = data.alert_decision;\n  const delivery = data.alert_delivery;\n  const now = delivery.completed_at;\n  const sent = delivery.status === 'sent';\n  const recovered = decision.reason === 'incident_recovered' && sent;\n  const firstSeen = previous?.first_seen_at || now;\n  const notificationCount = Number(previous?.notification_count || 0) + (sent ? 1 : 0);\n  const cooldownUntil = sent && !recovered\n    ? new Date(Date.parse(now) + decision.cooldown_minutes * 60 * 1000).toISOString()\n    : previous?.cooldown_until || '';\n\n  return { json: { ...data, alert_state_write: {\n    alert_key: 'v4_operations_health',\n    status: recovered || data.health === 'healthy' ? 'resolved' : 'open',\n    severity: data.health,\n    fingerprint: data.operational_alert.fingerprint,\n    reasons_json: JSON.stringify(data.health_reasons ?? []),\n    first_seen_at: firstSeen,\n    last_seen_at: now,\n    last_notified_at: sent ? now : previous?.last_notified_at || '',\n    notification_count: notificationCount,\n    cooldown_until: cooldownUntil,\n    resolved_at: recovered ? now : previous?.resolved_at || '',\n    last_message: decision.text,\n    last_provider_message_id: sent ? delivery.provider_message_id : previous?.last_provider_message_id || '',\n    last_error: delivery.error || '',\n  } } };\n});"
+      }
+    },
+    {
+      "id": "e87425af-799e-4f35-a223-0a0b3d9ea7e4",
+      "name": "Upsert Operations Alert State",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3120,
+        0
+      ],
+      "parameters": {
+        "operation": "upsert",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_alert_state_v4"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "alert_key",
+              "condition": "eq",
+              "keyValue": "v4_operations_health"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "alert_key": "={{ $json.alert_state_write.alert_key }}",
+            "status": "={{ $json.alert_state_write.status }}",
+            "severity": "={{ $json.alert_state_write.severity }}",
+            "fingerprint": "={{ $json.alert_state_write.fingerprint }}",
+            "reasons_json": "={{ $json.alert_state_write.reasons_json }}",
+            "first_seen_at": "={{ $json.alert_state_write.first_seen_at }}",
+            "last_seen_at": "={{ $json.alert_state_write.last_seen_at }}",
+            "last_notified_at": "={{ $json.alert_state_write.last_notified_at }}",
+            "notification_count": "={{ $json.alert_state_write.notification_count }}",
+            "cooldown_until": "={{ $json.alert_state_write.cooldown_until }}",
+            "resolved_at": "={{ $json.alert_state_write.resolved_at }}",
+            "last_message": "={{ $json.alert_state_write.last_message }}",
+            "last_provider_message_id": "={{ $json.alert_state_write.last_provider_message_id }}",
+            "last_error": "={{ $json.alert_state_write.last_error }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "alert_key",
+              "displayName": "alert_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "severity",
+              "displayName": "severity",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "fingerprint",
+              "displayName": "fingerprint",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reasons_json",
+              "displayName": "reasons_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "first_seen_at",
+              "displayName": "first_seen_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_seen_at",
+              "displayName": "last_seen_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_notified_at",
+              "displayName": "last_notified_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "notification_count",
+              "displayName": "notification_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "cooldown_until",
+              "displayName": "cooldown_until",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "resolved_at",
+              "displayName": "resolved_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_message",
+              "displayName": "last_message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_provider_message_id",
+              "displayName": "last_provider_message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_error",
+              "displayName": "last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "2eb0c4f2-3798-4017-9dfb-b4f54af7c489",
+      "name": "Restore Alert State Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        0
+      ],
+      "parameters": {
+        "jsCode": "const originals = $('Prepare Alert State Persistence').all();\nreturn $input.all().map((item, index) => ({ json: {\n  ...originals[index].json,\n  alert_state_persisted: !item.json.error,\n  persisted_row_id: item.json.id ?? null,\n} }));"
+      }
+    },
+    {
+      "id": "bd9bcd17-a050-4e3e-b081-be52e3db161b",
+      "name": "Build Alert Run Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        0
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: {\n  health: item.json.health,\n  health_reasons: item.json.health_reasons,\n  decision: item.json.alert_decision.reason,\n  delivery_status: item.json.alert_delivery.status,\n  provider_called: item.json.alert_delivery.attempted,\n  provider_message_id: item.json.alert_delivery.provider_message_id || null,\n  fingerprint: item.json.operational_alert.fingerprint,\n  incident_status: item.json.alert_state_write.status,\n  notification_count: item.json.alert_state_write.notification_count,\n  cooldown_until: item.json.alert_state_write.cooldown_until || null,\n  state_persisted: item.json.alert_state_persisted,\n} }));"
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get V4 Inquiries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get V4 Inquiries": {
+      "main": [
+        [
+          {
+            "node": "Collect Inquiry Snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Inquiry Snapshot": {
+      "main": [
+        [
+          {
+            "node": "Get V4 Dead Letters",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get V4 Dead Letters": {
+      "main": [
+        [
+          {
+            "node": "Build Operations Dashboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Operations Dashboard": {
+      "main": [
+        [
+          {
+            "node": "Prepare Health Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Health Alert": {
+      "main": [
+        [
+          {
+            "node": "Get Operations Alert State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Health Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Operations Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Alert Suppressed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Operations Alert State": {
+      "main": [
+        [
+          {
+            "node": "Attach Alert State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Alert State": {
+      "main": [
+        [
+          {
+            "node": "Decide Alert Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide Alert Notification": {
+      "main": [
+        [
+          {
+            "node": "Route Health Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Operations Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Normalize Health Alert Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Health Alert Result": {
+      "main": [
+        [
+          {
+            "node": "Prepare Alert State Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Alert Suppressed": {
+      "main": [
+        [
+          {
+            "node": "Prepare Alert State Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Alert State Persistence": {
+      "main": [
+        [
+          {
+            "node": "Upsert Operations Alert State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Operations Alert State": {
+      "main": [
+        [
+          {
+            "node": "Restore Alert State Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Alert State Context": {
+      "main": [
+        [
+          {
+            "node": "Build Alert Run Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {},
+  "active": false,
+  "tags": [],
+  "isArchived": false,
+  "nodeGroups": [],
+  "sourceWorkflowId": null
+}

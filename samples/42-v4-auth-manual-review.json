@@ -1,0 +1,8 @@
+{
+  "source": "website_form",
+  "source_event_id": "web_v4_0007",
+  "received_at": "2026-10-02T08:40:00Z",
+  "customer": { "name": "Manual Review V4", "email": null, "phone": null },
+  "message": { "subject": "Basement project", "body": "We would like information about finishing our basement in Brooklyn.", "channel": "form" },
+  "metadata": { "page_url": "https://summit-ridge.example/contact", "utm_source": "v4_regression", "location_hint": "Brooklyn, NY" }
+}

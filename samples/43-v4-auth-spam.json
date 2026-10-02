@@ -1,0 +1,8 @@
+{
+  "source": "website_form",
+  "source_event_id": "web_v4_0008",
+  "received_at": "2026-10-02T08:42:00Z",
+  "customer": { "name": "Regression Vendor", "email": "vendor.regression.v4@example.com", "phone": "+1-555-555-0153" },
+  "message": { "subject": "Guaranteed contractor leads", "body": "Buy our bulk contractor leads and search-ranking package. This is a sales solicitation, not a construction request.", "channel": "form" },
+  "metadata": { "page_url": "https://summit-ridge.example/contact", "utm_source": "v4_regression", "location_hint": null }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "construction_alert_state_v4",
+  "description": "Persistent V4 operations incident fingerprints, notification cooldown, and recovery state.",
+  "columns": [
+    { "name": "alert_key", "type": "string" },
+    { "name": "status", "type": "string" },
+    { "name": "severity", "type": "string" },
+    { "name": "fingerprint", "type": "string" },
+    { "name": "reasons_json", "type": "string" },
+    { "name": "first_seen_at", "type": "string" },
+    { "name": "last_seen_at", "type": "string" },
+    { "name": "last_notified_at", "type": "string" },
+    { "name": "notification_count", "type": "number" },
+    { "name": "cooldown_until", "type": "string" },
+    { "name": "resolved_at", "type": "string" },
+    { "name": "last_message", "type": "string" },
+    { "name": "last_provider_message_id", "type": "string" },
+    { "name": "last_error", "type": "string" }
+  ]
+}

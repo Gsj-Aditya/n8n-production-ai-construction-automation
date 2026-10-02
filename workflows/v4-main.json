@@ -1,0 +1,4155 @@
+{
+  "name": "V4 - Production Construction Automation Engine",
+  "description": "Portfolio template: AI-enriched construction inquiry intake with idempotency, Groq classification, deterministic rules, HubSpot Contact/Deal synchronization, retries, fallbacks, and persistent audit status.",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "construction-inquiry-v4",
+        "responseMode": "responseNode",
+        "options": {},
+        "authentication": "headerAuth"
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        736
+      ],
+      "id": "8743f035-c33b-483a-add3-34c98b1dbcdb",
+      "name": "Receive Enquiry",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "CONFIGURE_HTTPHEADERAUTH",
+          "name": "CONFIGURE: Webhook Header Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const clean = (value) => {\n  if (typeof value !== 'string') return null;\n  const result = value.trim();\n  return result.length > 0 ? result : null;\n};\n\nreturn $input.all().map((item) => {\n  // Webhook input is wrapped in `body`. Direct test input may already be canonical.\n  const raw = item.json.body ?? item.json;\n  const customer = raw.customer ?? {};\n  const message = raw.message ?? {};\n  const metadata = raw.metadata ?? {};\n\n  const email = clean(customer.email);\n\n  return {\n    json: {\n      source: clean(raw.source)?.toLowerCase() ?? null,\n      source_event_id: clean(raw.source_event_id),\n      received_at: clean(raw.received_at),\n      customer: {\n        name: clean(customer.name),\n        email: email?.toLowerCase() ?? null,\n        phone: clean(customer.phone),\n      },\n      message: {\n        subject: clean(message.subject),\n        body: clean(message.body),\n        channel: clean(message.channel)?.toLowerCase() ?? null,\n      },\n      metadata: {\n        page_url: clean(metadata.page_url),\n        utm_source: clean(metadata.utm_source)?.toLowerCase() ?? null,\n        location_hint: clean(metadata.location_hint),\n      },\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        736
+      ],
+      "id": "a37ba0f2-d7de-474f-891e-7ca81f98f593",
+      "name": "Normalize Inquiry"
+    },
+    {
+      "parameters": {
+        "jsCode": "const allowedSources = new Set([\n  'website_form',\n  'gmail',\n  'manual_api',\n  'phone_note',\n  'partner_referral',\n]);\n\nconst allowedChannels = new Set([\n  'form',\n  'email',\n  'api',\n  'phone_note',\n  'referral',\n]);\n\nconst emailPattern = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n\nreturn $input.all().map((item) => {\n  const inquiry = item.json;\n  const blockingIssues = [];\n  const reviewIssues = [];\n\n  const addBlocking = (field, code, message) => {\n    blockingIssues.push({ field, code, message });\n  };\n\n  const addReview = (field, code, message) => {\n    reviewIssues.push({ field, code, message });\n  };\n\n  if (!inquiry.source) {\n    addBlocking('source', 'required', 'Source is required.');\n  } else if (!allowedSources.has(inquiry.source)) {\n    addBlocking('source', 'invalid_enum', 'Source is not supported.');\n  }\n\n  if (!inquiry.source_event_id) {\n    addBlocking('source_event_id', 'required', 'Source event ID is required.');\n  }\n\n  if (!inquiry.received_at) {\n    addBlocking('received_at', 'required', 'Received timestamp is required.');\n  } else if (Number.isNaN(Date.parse(inquiry.received_at))) {\n    addBlocking('received_at', 'invalid_datetime', 'Received timestamp must be a valid ISO date-time.');\n  }\n\n  if (!inquiry.message?.body) {\n    addBlocking('message.body', 'required', 'Inquiry message body is required.');\n  }\n\n  if (!inquiry.message?.channel) {\n    addBlocking('message.channel', 'required', 'Message channel is required.');\n  } else if (!allowedChannels.has(inquiry.message.channel)) {\n    addBlocking('message.channel', 'invalid_enum', 'Message channel is not supported.');\n  }\n\n  const email = inquiry.customer?.email;\n  const phone = inquiry.customer?.phone;\n\n  if (!email && !phone) {\n    addReview(\n      'customer',\n      'missing_contact_method',\n      'At least one of email or phone is required for automatic processing.'\n    );\n  }\n\n  if (email && !emailPattern.test(email)) {\n    addReview('customer.email', 'invalid_email', 'Email format is invalid.');\n  }\n\n  if (phone) {\n    const phoneDigits = phone.replace(/\\D/g, '');\n    if (phoneDigits.length < 8 || phoneDigits.length > 15) {\n      addReview('customer.phone', 'invalid_phone', 'Phone must contain 8 to 15 digits.');\n    }\n  }\n\n  let disposition = 'accepted';\n\n  if (blockingIssues.length > 0) {\n    disposition = 'rejected';\n  } else if (reviewIssues.length > 0) {\n    disposition = 'manual_review';\n  }\n\n  return {\n    json: {\n      ...inquiry,\n      validation: {\n        is_valid: disposition === 'accepted',\n        disposition,\n        issues: [...blockingIssues, ...reviewIssues],\n      },\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        736
+      ],
+      "id": "4e55cc2a-b00d-4924-9dad-8f1cb406667b",
+      "name": "Validate Enquiry"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.validation.disposition }}",
+                    "rightValue": "accepted",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "d4dced49-e78f-42ac-855d-9bd583679b4d"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Accepted"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "cb58d483-ca2d-48cd-9e08-d6e285f66310",
+                    "leftValue": "={{ $json.validation.disposition }}",
+                    "rightValue": "rejected",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Rejected"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "902d4711-f593-49f2-8177-368ed8e8759f",
+                    "leftValue": "={{ $json.validation.disposition }}",
+                    "rightValue": "manual_review",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Manual_Review"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        896,
+        704
+      ],
+      "id": "94d7695f-d1bc-4262-b74b-bd210ad2a402",
+      "name": "Route by dispostion"
+    },
+    {
+      "parameters": {
+        "enableResponseOutput": true,
+        "respondWith": "json",
+        "responseBody": "={{ {\n  status: \"rejected\",\n  source_event_id: $json.source_event_id,\n  issues: $json.validation.issues,\n  message: \"Inquiry payload failed validation\"\n} }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1120,
+        448
+      ],
+      "id": "fe57c546-3c6e-4520-92ed-15fb0509e155",
+      "name": "Respond - Rejected"
+    },
+    {
+      "parameters": {
+        "enableResponseOutput": true,
+        "respondWith": "json",
+        "responseBody": "={{ {\n  status: \"error\",\n  source_event_id: $json.source_event_id ?? null,\n  message: \"Unexpected validation disposition\"\n} }}",
+        "options": {
+          "responseCode": 500
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1120,
+        1024
+      ],
+      "id": "e3842b39-2eb4-44e1-9084-1923c7ea9323",
+      "name": "Respond - Routing Error"
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => {\n  const inquiry = item.json;\n  const source = inquiry.source;\n  const sourceEventId = inquiry.source_event_id;\n  const executionId = String($execution.id);\n  const dedupKey = source && sourceEventId ? `${source}:${sourceEventId}` : null;\n  const inquiryId = dedupKey\n    ? `inq_${source}_${sourceEventId}`.replace(/[^a-zA-Z0-9_-]/g, '_')\n    : `attempt_${executionId}`;\n  const startedAt = new Date().toISOString();\n\n  return {\n    json: {\n      ...inquiry,\n      identity: {\n        inquiry_id: inquiryId,\n        dedup_key: dedupKey,\n        correlation_id: `${inquiryId}:exec:${executionId}`,\n        execution_id: executionId,\n      },\n      operations: {\n        correlation_id: `${inquiryId}:exec:${executionId}`,\n        execution_id: executionId,\n        processing_stage: 'identity_generated',\n        processing_started_at: startedAt,\n        processing_finished_at: null,\n        processing_duration_ms: 0,\n        last_successful_stage: 'identity_generated',\n        error_stage: null,\n        error_category: null,\n        dead_letter_id: null,\n        reprocessing_status: 'not_required',\n        reprocessing_attempt_count: 0,\n        last_reprocessed_at: null,\n      },\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        736
+      ],
+      "id": "ffeb6328-7933-47e2-8c3d-140753b1b976",
+      "name": "Generate Identity"
+    },
+    {
+      "parameters": {
+        "operation": "rowExists",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "dedup_key",
+              "keyValue": "={{ $json.identity.dedup_key }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        640
+      ],
+      "id": "9ab8f28c-2faa-4d18-95bb-5e5ceceb2d53",
+      "name": "Check Duplicate",
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "dedup_key",
+              "keyValue": "={{ $json.identity.dedup_key }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1120,
+        832
+      ],
+      "id": "90e010fb-28b8-4de8-a917-a6caf9ac65f7",
+      "name": "Check New Inquiry"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ {\n  status: \"error\",\n  source_event_id: $json.source_event_id ?? null,\n  message: \"Unexpected validation disposition\"\n} }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2016,
+        976
+      ],
+      "id": "0f033a46-5980-401c-8094-7134e3ffc00b",
+      "name": "Respond to Routing Error in Duplicate Checking"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "9c83f222-8f17-44c0-b277-dba03e641e44",
+                    "leftValue": "={{ $json.validation.disposition }}",
+                    "rightValue": "manual_review",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Manual_Review"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "a625c9e7-c26e-4f02-b18a-93fd8f507b78",
+                    "leftValue": "={{ $json.validation.disposition }}",
+                    "rightValue": "accepted",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Accepted"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        1792,
+        816
+      ],
+      "id": "a33ebc1b-2fbb-4be9-9530-6eb95959d381",
+      "name": "Route New Inquiry"
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "dedup_key": "={{ $json.identity.dedup_key }}",
+            "inquiry_id": "={{ $json.identity.inquiry_id }}",
+            "source": "={{ $json.source }}",
+            "source_event_id": "={{ $json.source_event_id }}",
+            "disposition": "={{ $json.validation.disposition }}",
+            "received_at": "={{ $json.received_at }}",
+            "stored_at": "={{ $now.toUTC().toISO() }}",
+            "payload_json": "={{ JSON.stringify($json) }}",
+            "automation_status": "received",
+            "ai_status": "not_run",
+            "ai_result_json": "null",
+            "hubspot_contact_id": "",
+            "hubspot_deal_id": "",
+            "last_error": "",
+            "completed_at": "",
+            "result_json": "{}",
+            "ack_status": "not_evaluated",
+            "ack_message_type": "",
+            "ack_sent_at": "",
+            "slack_status": "not_evaluated",
+            "slack_sent_at": "",
+            "followup_status": "not_evaluated",
+            "followup_due_at": "",
+            "followup_sent_at": "",
+            "communication_last_error": "",
+            "communication_result_json": "{}",
+            "correlation_id": "={{ $json.operations.correlation_id }}",
+            "execution_id": "={{ $json.operations.execution_id }}",
+            "processing_stage": "intake_stored",
+            "processing_started_at": "={{ $json.operations.processing_started_at }}",
+            "processing_finished_at": "",
+            "processing_duration_ms": 0,
+            "last_successful_stage": "intake_stored",
+            "error_stage": "",
+            "error_category": "",
+            "dead_letter_id": "",
+            "reprocessing_status": "not_required",
+            "reprocessing_attempt_count": 0,
+            "last_reprocessed_at": ""
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "dedup_key",
+              "displayName": "dedup_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "inquiry_id",
+              "displayName": "inquiry_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_event_id",
+              "displayName": "source_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "disposition",
+              "displayName": "disposition",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "received_at",
+              "displayName": "received_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "stored_at",
+              "displayName": "stored_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "payload_json",
+              "displayName": "payload_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "automation_status",
+              "displayName": "automation_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_status",
+              "displayName": "ai_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_result_json",
+              "displayName": "ai_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_contact_id",
+              "displayName": "hubspot_contact_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_deal_id",
+              "displayName": "hubspot_deal_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_error",
+              "displayName": "last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "completed_at",
+              "displayName": "completed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "result_json",
+              "displayName": "result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_status",
+              "displayName": "ack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_message_type",
+              "displayName": "ack_message_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_sent_at",
+              "displayName": "ack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_status",
+              "displayName": "slack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_sent_at",
+              "displayName": "slack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_status",
+              "displayName": "followup_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_due_at",
+              "displayName": "followup_due_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_sent_at",
+              "displayName": "followup_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_last_error",
+              "displayName": "communication_last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_result_json",
+              "displayName": "communication_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "correlation_id",
+              "displayName": "correlation_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "execution_id",
+              "displayName": "execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_stage",
+              "displayName": "processing_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_started_at",
+              "displayName": "processing_started_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_finished_at",
+              "displayName": "processing_finished_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_duration_ms",
+              "displayName": "processing_duration_ms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_successful_stage",
+              "displayName": "last_successful_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_stage",
+              "displayName": "error_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_category",
+              "displayName": "error_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "dead_letter_id",
+              "displayName": "dead_letter_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_status",
+              "displayName": "reprocessing_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_attempt_count",
+              "displayName": "reprocessing_attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_reprocessed_at",
+              "displayName": "last_reprocessed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1344,
+        832
+      ],
+      "id": "d6430e01-c8c2-49c0-82b2-774d26371b2b",
+      "name": "Store Intake"
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map((item, index) => {\n  const storedRow = item.json;\n  const originalInquiry = $('Check New Inquiry').itemMatching(index).json;\n\n  return {\n    json: {\n      ...originalInquiry,\n      storage: {\n        stored: true,\n        table: 'construction_inquiries_v4',\n        row_id: storedRow.id ?? null,\n        stored_at: storedRow.stored_at,\n      },\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        832
+      ],
+      "id": "4ff054d8-5764-4736-aeeb-e74108affd6d",
+      "name": "Restore Inquiry Context"
+    },
+    {
+      "parameters": {
+        "enableResponseOutput": true,
+        "respondWith": "json",
+        "responseBody": "={{ {\n  status: \"duplicate\",\n  inquiry_id: $json.identity.inquiry_id,\n  source_event_id: $json.source_event_id,\n  message: \"Inquiry was already received; no duplicate processing was performed\"\n} }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1344,
+        640
+      ],
+      "id": "f40bf7c1-e372-4e42-9905-4cbdcc264a88",
+      "name": "Respond Duplicate"
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => {\n  const inquiry = item.json;\n\n  return {\n    json: {\n      ...inquiry,\n      ai: {\n        status: 'pending',\n        input: {\n          canonical_contact: inquiry.customer,\n          source: inquiry.source,\n          source_event_id: inquiry.source_event_id,\n          received_at: inquiry.received_at,\n          subject: inquiry.message?.subject ?? null,\n          body: inquiry.message?.body ?? null,\n          channel: inquiry.message?.channel ?? null,\n          location_hint: inquiry.metadata?.location_hint ?? null,\n        },\n      },\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        576
+      ],
+      "id": "7b71d5c2-23cd-4fad-838b-d6e2d02b2890",
+      "name": "Prepare AI Input"
+    },
+    {
+      "parameters": {
+        "jsCode": "const systemPrompt = \"# Role\\n\\nYou extract and classify facts from inbound construction and remodeling inquiries for Summit Ridge Renovations.\\n\\n# Boundaries\\n\\n- Use only the supplied inquiry JSON.\\n- Do not invent names, contact details, locations, budgets, timelines, services, or urgency.\\n- Use `null` or `unknown` when the inquiry does not provide enough evidence.\\n- `exact_budget_amount` must be non-null only when the source explicitly states a numeric project budget.\\n- `currency` must be non-null only when it is explicit or unambiguous from a currency symbol.\\n- Keep `summary` factual and concise.\\n- `confidence` measures confidence in the complete classification, from 0 to 1.\\n- `signals` must contain only evidence-supported labels.\\n- `signals` may contain only these exact values: `safety_risk`, `active_damage`, `same_day_request`, `short_timeline`, `explicit_budget`, `commercial_project`, `detailed_scope`, `vague_request`, `spam_signal`.\\n- Do not copy category, timeline, budget-range, property-type, or lead-quality values into `signals`. For example, `within_90_days` is a timeline value and must not appear in `signals`.\\n- Use an empty `signals` array when none of the allowed evidence labels apply.\\n- Do not decide CRM stages, owners, notifications, acknowledgment behavior, or final business actions. Deterministic workflow rules handle those decisions.\\n\\n# Category definitions\\n\\n- `emergency_repair`: active water intrusion, flood, fire damage, unsafe structure, collapse risk, or similar immediate damage.\\n- `remodel`: kitchen, bathroom, basement, or whole-home renovation.\\n- `roofing`: roof repair, leak investigation, replacement, or storm inspection.\\n- `commercial`: office, retail, tenant improvement, or other commercial work.\\n- `outdoor`: decks, patios, fences, and exterior structures.\\n- `general_question`: unclear scope, pricing question, or request not fitting another category.\\n\\n# Urgency definitions\\n\\n- `emergency`: active damage or immediate safety risk.\\n- `time_sensitive`: explicit same-day/short deadline or desired work within seven days without active emergency damage.\\n- `routine`: clear non-emergency project.\\n- `unknown`: insufficient timeline or urgency evidence.\\n\\n# Lead-quality definitions\\n\\n- `qualified`: clear service need and enough information for sales follow-up.\\n- `needs_more_info`: potentially relevant inquiry missing important qualification details.\\n- `not_a_fit`: clearly outside offered construction/remodeling services.\\n- `spam`: solicitation, nonsense, malicious content, or unrelated bulk message.\\n\\n# Contact reconciliation\\n\\nExtract Contact values found in the subject/body, but do not override canonical structured Contact fields. The deterministic workflow may use extracted values only to fill a canonical field that is currently null and passes validation.\\n\";\nconst augmentedSystemPrompt = `${systemPrompt}\\n- service_requested must always be a non-empty string. For spam or unrelated messages, use a factual label such as \"Unrelated solicitation\" or \"Unrelated message\"; never return null for this field.\\n`;\n\nconst strictSchema = {\n  \"type\": \"object\",\n  \"additionalProperties\": false,\n  \"required\": [\n    \"extracted_contact\",\n    \"project\",\n    \"classification\",\n    \"summary\",\n    \"missing_fields\",\n    \"signals\"\n  ],\n  \"properties\": {\n    \"extracted_contact\": {\n      \"type\": \"object\",\n      \"additionalProperties\": false,\n      \"required\": [\n        \"name\",\n        \"email\",\n        \"phone\"\n      ],\n      \"properties\": {\n        \"name\": {\n          \"type\": [\n            \"string\",\n            \"null\"\n          ]\n        },\n        \"email\": {\n          \"type\": [\n            \"string\",\n            \"null\"\n          ]\n        },\n        \"phone\": {\n          \"type\": [\n            \"string\",\n            \"null\"\n          ]\n        }\n      }\n    },\n    \"project\": {\n      \"type\": \"object\",\n      \"additionalProperties\": false,\n      \"required\": [\n        \"category\",\n        \"service_requested\",\n        \"property_type\",\n        \"city\",\n        \"state\",\n        \"timeline\",\n        \"budget_range\",\n        \"exact_budget_amount\",\n        \"currency\"\n      ],\n      \"properties\": {\n        \"category\": {\n          \"type\": \"string\",\n          \"enum\": [\n            \"emergency_repair\",\n            \"remodel\",\n            \"roofing\",\n            \"commercial\",\n            \"outdoor\",\n            \"general_question\"\n          ]\n        },\n        \"service_requested\": {\n          \"type\": \"string\"\n        },\n        \"property_type\": {\n          \"type\": \"string\",\n          \"enum\": [\n            \"residential\",\n            \"commercial\",\n            \"unknown\"\n          ]\n        },\n        \"city\": {\n          \"type\": [\n            \"string\",\n            \"null\"\n          ]\n        },\n        \"state\": {\n          \"type\": [\n            \"string\",\n            \"null\"\n          ]\n        },\n        \"timeline\": {\n          \"type\": \"string\",\n          \"enum\": [\n            \"emergency\",\n            \"within_7_days\",\n            \"within_30_days\",\n            \"within_90_days\",\n            \"flexible\",\n            \"unknown\"\n          ]\n        },\n        \"budget_range\": {\n          \"type\": \"string\",\n          \"enum\": [\n            \"under_5k\",\n            \"5k_15k\",\n            \"15k_50k\",\n            \"50k_plus\",\n            \"unknown\"\n          ]\n        },\n        \"exact_budget_amount\": {\n          \"type\": [\n            \"number\",\n            \"null\"\n          ]\n        },\n        \"currency\": {\n          \"type\": [\n            \"string\",\n            \"null\"\n          ]\n        }\n      }\n    },\n    \"classification\": {\n      \"type\": \"object\",\n      \"additionalProperties\": false,\n      \"required\": [\n        \"urgency\",\n        \"lead_quality\",\n        \"confidence\"\n      ],\n      \"properties\": {\n        \"urgency\": {\n          \"type\": \"string\",\n          \"enum\": [\n            \"emergency\",\n            \"time_sensitive\",\n            \"routine\",\n            \"unknown\"\n          ]\n        },\n        \"lead_quality\": {\n          \"type\": \"string\",\n          \"enum\": [\n            \"qualified\",\n            \"needs_more_info\",\n            \"not_a_fit\",\n            \"spam\"\n          ]\n        },\n        \"confidence\": {\n          \"type\": \"number\",\n          \"minimum\": 0,\n          \"maximum\": 1\n        }\n      }\n    },\n    \"summary\": {\n      \"type\": \"string\"\n    },\n    \"missing_fields\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\",\n        \"enum\": [\n          \"name\",\n          \"email\",\n          \"phone\",\n          \"service_requested\",\n          \"property_type\",\n          \"location\",\n          \"timeline\",\n          \"budget\"\n        ]\n      }\n    },\n    \"signals\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"string\",\n        \"enum\": [\n          \"safety_risk\",\n          \"active_damage\",\n          \"same_day_request\",\n          \"short_timeline\",\n          \"explicit_budget\",\n          \"commercial_project\",\n          \"detailed_scope\",\n          \"vague_request\",\n          \"spam_signal\"\n        ]\n      }\n    }\n  }\n};\n\nreturn $input.all().map((item) => {\n  const inquiry = item.json;\n\n  return {\n    json: {\n      ...inquiry,\n      ai: {\n        ...inquiry.ai,\n        request: {\n          model: 'openai/gpt-oss-20b',\n          messages: [\n            { role: 'system', content: augmentedSystemPrompt },\n            { role: 'user', content: JSON.stringify(inquiry.ai.input) },\n          ],\n          response_format: {\n            type: 'json_schema',\n            json_schema: {\n              name: 'construction_inquiry_classification',\n              strict: true,\n              schema: strictSchema,\n            },\n          },\n          reasoning_effort: 'low',\n          max_completion_tokens: 1200,\n        },\n      },\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        576
+      ],
+      "id": "d213cb19-df94-4dfd-b038-49cf870fbfae",
+      "name": "Build Groq Request"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "groqApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.ai.request }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        2464,
+        576
+      ],
+      "id": "fc4a11ff-04c1-4c35-ac96-9df643e279e2",
+      "name": "Classify Inquiry - Groq",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "groqApi": {
+          "id": "CONFIGURE_GROQAPI",
+          "name": "CONFIGURE: Groq API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const requestItems = $('Build Groq Request').all();\n\nreturn $input.all().map((item, index) => {\n  const original = requestItems[index]?.json;\n  if (!original) {\n    throw new Error(`Missing original inquiry for Groq response item ${index}`);\n  }\n\n  if (item.json.error) {\n    const { request, ...aiWithoutRequest } = original.ai;\n    const message = item.json.error.message ?? String(item.json.error);\n    return {\n      json: {\n        ...original,\n        ai: {\n          ...aiWithoutRequest,\n          status: 'failed',\n          provider: 'groq',\n          model: 'openai/gpt-oss-20b',\n          result: null,\n          error: {\n            system: 'groq',\n            operation: 'classify_inquiry',\n            message,\n            retry_exhausted: true,\n          },\n        },\n      },\n    };\n  }\n\n  const content = item.json.choices?.[0]?.message?.content;\n  if (typeof content !== 'string' || content.length === 0) {\n    const { request, ...aiWithoutRequest } = original.ai;\n    return {\n      json: {\n        ...original,\n        ai: {\n          ...aiWithoutRequest,\n          status: 'failed',\n          provider: 'groq',\n          model: item.json.model ?? 'openai/gpt-oss-20b',\n          result: null,\n          error: {\n            system: 'groq',\n            operation: 'parse_response',\n            message: 'Groq response is missing choices[0].message.content',\n            retry_exhausted: false,\n          },\n        },\n      },\n    };\n  }\n\n  let result;\n  try {\n    result = JSON.parse(content);\n  } catch (error) {\n    const { request, ...aiWithoutRequest } = original.ai;\n    return {\n      json: {\n        ...original,\n        ai: {\n          ...aiWithoutRequest,\n          status: 'failed',\n          provider: 'groq',\n          model: item.json.model ?? 'openai/gpt-oss-20b',\n          result: null,\n          error: {\n            system: 'groq',\n            operation: 'parse_response',\n            message: `Groq returned invalid JSON: ${error.message}`,\n            retry_exhausted: false,\n          },\n        },\n      },\n    };\n  }\n\n  const { request, ...aiWithoutRequest } = original.ai;\n\n  return {\n    json: {\n      ...original,\n      ai: {\n        ...aiWithoutRequest,\n        status: 'completed',\n        provider: 'groq',\n        model: item.json.model ?? 'openai/gpt-oss-20b',\n        result,\n        usage: item.json.usage ?? null,\n      },\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2688,
+        576
+      ],
+      "id": "f1965105-c4ed-4ffc-b550-8e349a02450d",
+      "name": "Attach Groq Result"
+    },
+    {
+      "parameters": {
+        "jsCode": "const allowed = {\n  category: new Set([\n    'emergency_repair',\n    'remodel',\n    'roofing',\n    'commercial',\n    'outdoor',\n    'general_question',\n  ]),\n  propertyType: new Set(['residential', 'commercial', 'unknown']),\n  timeline: new Set([\n    'emergency',\n    'within_7_days',\n    'within_30_days',\n    'within_90_days',\n    'flexible',\n    'unknown',\n  ]),\n  budgetRange: new Set(['under_5k', '5k_15k', '15k_50k', '50k_plus', 'unknown']),\n  urgency: new Set(['emergency', 'time_sensitive', 'routine', 'unknown']),\n  leadQuality: new Set(['qualified', 'needs_more_info', 'not_a_fit', 'spam']),\n  missingField: new Set([\n    'name',\n    'email',\n    'phone',\n    'service_requested',\n    'property_type',\n    'location',\n    'timeline',\n    'budget',\n  ]),\n  signal: new Set([\n    'safety_risk',\n    'active_damage',\n    'same_day_request',\n    'short_timeline',\n    'explicit_budget',\n    'commercial_project',\n    'detailed_scope',\n    'vague_request',\n    'spam_signal',\n  ]),\n};\n\nconst normalizeEmail = (value) =>\n  typeof value === 'string' ? value.trim().toLowerCase() : null;\nconst normalizePhone = (value) =>\n  typeof value === 'string' ? value.replace(/\\D/g, '') : null;\n\nreturn $input.all().map((item) => {\n  const inquiry = item.json;\n  const result = inquiry.ai?.result;\n  const issues = [];\n  const warnings = [];\n\n  const issue = (code, path, message) => issues.push({ code, path, message });\n  const warning = (code, path, message) => warnings.push({ code, path, message });\n\n  if (!result || typeof result !== 'object' || Array.isArray(result)) {\n    issue('missing_result', 'ai.result', 'AI result must be an object.');\n  } else {\n    const resultLeadQuality = result.classification?.lead_quality;\n    if (!allowed.category.has(result.project?.category)) {\n      issue('invalid_enum', 'project.category', 'Unsupported project category.');\n    }\n    if (!['spam', 'not_a_fit'].includes(resultLeadQuality) &&\n        (typeof result.project?.service_requested !== 'string' || !result.project.service_requested.trim())) {\n      issue('required', 'project.service_requested', 'Service requested must be non-empty text.');\n    }\n    if (!allowed.propertyType.has(result.project?.property_type)) {\n      issue('invalid_enum', 'project.property_type', 'Unsupported property type.');\n    }\n    if (!allowed.timeline.has(result.project?.timeline)) {\n      issue('invalid_enum', 'project.timeline', 'Unsupported timeline.');\n    }\n    if (!allowed.budgetRange.has(result.project?.budget_range)) {\n      issue('invalid_enum', 'project.budget_range', 'Unsupported budget range.');\n    }\n    const exactBudget = result.project?.exact_budget_amount;\n    if (exactBudget !== null && (!Number.isFinite(exactBudget) || exactBudget < 0)) {\n      issue('invalid_number', 'project.exact_budget_amount', 'Exact budget must be null or a non-negative number.');\n    }\n    if (!allowed.urgency.has(result.classification?.urgency)) {\n      issue('invalid_enum', 'classification.urgency', 'Unsupported urgency.');\n    }\n    if (!allowed.leadQuality.has(result.classification?.lead_quality)) {\n      issue('invalid_enum', 'classification.lead_quality', 'Unsupported lead quality.');\n    }\n    const confidence = result.classification?.confidence;\n    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {\n      issue('invalid_confidence', 'classification.confidence', 'Confidence must be between 0 and 1.');\n    } else if (confidence < 0.75) {\n      issue('low_confidence', 'classification.confidence', 'Confidence is below the 0.75 automation threshold.');\n    }\n    if (typeof result.summary !== 'string' || !result.summary.trim()) {\n      issue('required', 'summary', 'Summary must be non-empty text.');\n    }\n    if (!Array.isArray(result.missing_fields) ||\n        result.missing_fields.some((value) => !allowed.missingField.has(value))) {\n      issue('invalid_array', 'missing_fields', 'Missing fields contain an unsupported value.');\n    }\n    if (!Array.isArray(result.signals) ||\n        result.signals.some((value) => !allowed.signal.has(value))) {\n      issue('invalid_array', 'signals', 'Signals contain an unsupported value.');\n    }\n\n    const canonicalEmail = normalizeEmail(inquiry.customer?.email);\n    const extractedEmail = normalizeEmail(result.extracted_contact?.email);\n    if (canonicalEmail && extractedEmail && canonicalEmail !== extractedEmail) {\n      warning('contact_conflict', 'extracted_contact.email', 'Extracted email differs from canonical email; canonical value wins.');\n    }\n\n    const canonicalPhone = normalizePhone(inquiry.customer?.phone);\n    const extractedPhone = normalizePhone(result.extracted_contact?.phone);\n    if (canonicalPhone && extractedPhone && canonicalPhone !== extractedPhone) {\n      warning('contact_conflict', 'extracted_contact.phone', 'Extracted phone differs from canonical phone; canonical value wins.');\n    }\n  }\n\n  const schemaValid = issues.every((entry) => entry.code !== 'missing_result' && entry.code !== 'invalid_enum' && entry.code !== 'invalid_number' && entry.code !== 'invalid_confidence' && entry.code !== 'invalid_array' && entry.code !== 'required');\n  const confidenceAcceptable = !issues.some((entry) => entry.code === 'low_confidence' || entry.code === 'invalid_confidence');\n  const leadQuality = result?.classification?.lead_quality;\n\n  let disposition = 'continue';\n  if (!schemaValid || !confidenceAcceptable) disposition = 'manual_review';\n  if (leadQuality === 'spam' || leadQuality === 'not_a_fit') disposition = 'stop_no_crm';\n\n  return {\n    json: {\n      ...inquiry,\n      ai: {\n        ...inquiry.ai,\n        validation: {\n          is_valid: issues.length === 0,\n          schema_valid: schemaValid,\n          confidence_acceptable: confidenceAcceptable,\n          disposition,\n          issues,\n          warnings,\n        },\n      },\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2912,
+        576
+      ],
+      "id": "fb87f2c0-ddd7-4070-9253-a2e66c255154",
+      "name": "Validate AI Result"
+    },
+    {
+      "parameters": {
+        "jsCode": "const pipelineId = 'default';\nconst newInquiryStageId = 'appointmentscheduled';\n\nconst budgetRangeFor = (amount) => {\n  if (!Number.isFinite(amount)) return null;\n  if (amount < 5000) return 'under_5k';\n  if (amount < 15000) return '5k_15k';\n  if (amount < 50000) return '15k_50k';\n  return '50k_plus';\n};\n\nreturn $input.all().map((item) => {\n  const inquiry = item.json;\n  const result = inquiry.ai.result;\n  const validation = inquiry.ai.validation;\n  const project = result.project;\n  const classification = result.classification;\n  const signals = new Set(result.signals);\n\n  const emergency =\n    classification.urgency === 'emergency' ||\n    project.timeline === 'emergency' ||\n    signals.has('safety_risk') ||\n    signals.has('active_damage') ||\n    signals.has('same_day_request');\n\n  const highValue =\n    Number.isFinite(project.exact_budget_amount) &&\n    project.exact_budget_amount >= 50000;\n\n  const timeSensitive =\n    classification.urgency === 'time_sensitive' ||\n    project.timeline === 'within_7_days' ||\n    project.timeline === 'within_30_days' ||\n    signals.has('short_timeline');\n\n  let priority = 'normal';\n  if (emergency) priority = 'urgent';\n  else if (highValue || timeSensitive || project.category === 'commercial') priority = 'high';\n  else if (classification.lead_quality === 'needs_more_info' || signals.has('vague_request')) priority = 'low';\n\n  let assignedRole = 'office_coordinator';\n  if (emergency || project.category === 'commercial') assignedRole = 'owner';\n  else if (['roofing', 'remodel'].includes(project.category)) assignedRole = 'estimator';\n  else if (project.category === 'outdoor') assignedRole = 'project_manager';\n\n  let nextAction = 'schedule_site_visit';\n  if (emergency) nextAction = 'call_now';\n  else if (classification.lead_quality === 'needs_more_info' || result.missing_fields.length > 0) {\n    nextAction = 'request_missing_info';\n  } else if (project.category === 'general_question') {\n    nextAction = 'send_estimate_request';\n  }\n\n  let acknowledgmentType = 'standard';\n  if (emergency) acknowledgmentType = 'urgent';\n  else if (nextAction === 'request_missing_info') acknowledgmentType = 'missing_info';\n\n  const crmAllowed =\n    validation.disposition === 'continue' &&\n    validation.is_valid &&\n    !['spam', 'not_a_fit'].includes(classification.lead_quality);\n\n  const canonical = inquiry.customer ?? {};\n  const extracted = result.extracted_contact ?? {};\n  const finalContact = {\n    name: canonical.name ?? extracted.name ?? null,\n    email: canonical.email ?? extracted.email ?? null,\n    phone: canonical.phone ?? extracted.phone ?? null,\n    city: project.city,\n    state: project.state,\n  };\n\n  const exactBudget = Number.isFinite(project.exact_budget_amount)\n    ? project.exact_budget_amount\n    : null;\n  const correctedBudgetRange = budgetRangeFor(exactBudget) ?? project.budget_range;\n\n  return {\n    json: {\n      ...inquiry,\n      business: {\n        priority,\n        assigned_role: assignedRole,\n        next_action: nextAction,\n        acknowledgment_type: acknowledgmentType,\n        crm_allowed: crmAllowed,\n        contact: finalContact,\n        deal: {\n          name: `${project.service_requested} - ${finalContact.name ?? 'Unknown Contact'}`,\n          pipeline_id: pipelineId,\n          stage_id: newInquiryStageId,\n          category: project.category,\n          service_requested: project.service_requested,\n          property_type: project.property_type,\n          timeline: project.timeline,\n          budget_range: correctedBudgetRange,\n          exact_budget_amount: exactBudget,\n          city: project.city,\n          state: project.state,\n          lead_quality: classification.lead_quality,\n          ai_summary: result.summary,\n          ai_confidence: classification.confidence,\n          missing_fields: result.missing_fields,\n        },\n      },\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        448
+      ],
+      "id": "2ffb8526-33c3-41f1-ad04-f9ca419f316f",
+      "name": "Add Business Rules"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.ai.validation.disposition }}",
+                    "rightValue": "continue",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "746953c2-d54d-47d9-8318-cd6e369f6950"
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Continue"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "3f5e12a3-3527-4613-a016-e1e439eff0be",
+                    "leftValue": "={{ $json.ai.validation.disposition }}",
+                    "rightValue": "manual_review",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Manual_Review"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "f90063b4-54bb-471f-84c0-ab481e75d7e5",
+                    "leftValue": "={{ $json.ai.validation.disposition }}",
+                    "rightValue": "stop_no_crm",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Stop_NO_CRM"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        3136,
+        544
+      ],
+      "id": "e6b48b2f-6545-47b5-9699-ef94e3538539",
+      "name": "Rule AI Outcome"
+    },
+    {
+      "parameters": {
+        "jsCode": "const searchItems = $('Build HubSpot Contact Search').all();\n\nreturn $input.all().map((item, index) => {\n  const original = searchItems[index]?.json;\n  if (!original) {\n    throw new Error(`Missing original inquiry for HubSpot Contact search item ${index}`);\n  }\n\n  if (item.json.error) {\n    const { search_request, ...contactContext } = original.hubspot.contact;\n    return {\n      json: {\n        ...original,\n        hubspot: {\n          ...original.hubspot,\n          status: 'contact_search_error',\n          error: {\n            system: 'hubspot',\n            operation: 'search_contact',\n            message: item.json.error.message ?? String(item.json.error),\n            retry_exhausted: true,\n          },\n          contact: {\n            ...contactContext,\n            search_status: 'api_error',\n            match_count: 0,\n            contact_id: null,\n          },\n        },\n      },\n    };\n  }\n\n  const results = Array.isArray(item.json.results) ? item.json.results : [];\n  const matchCount = results.length;\n  const existing = matchCount === 1 ? results[0] : null;\n\n  let searchStatus = 'not_found';\n  if (matchCount === 1) searchStatus = 'found';\n  if (matchCount > 1) searchStatus = 'multiple_matches';\n\n  const { search_request, ...contactContext } = original.hubspot.contact;\n  const updateProperties = { ...contactContext.update_properties };\n\n  if (existing?.properties?.construction_lead_source) {\n    delete updateProperties.construction_lead_source;\n  }\n  if (!existing?.properties?.construction_first_inquiry_at) {\n    updateProperties.construction_first_inquiry_at = original.received_at;\n  }\n\n  return {\n    json: {\n      ...original,\n      hubspot: {\n        ...original.hubspot,\n        status: `contact_${searchStatus}`,\n        contact: {\n          ...contactContext,\n          update_properties: updateProperties,\n          search_status: searchStatus,\n          match_count: matchCount,\n          contact_id: existing?.id ?? null,\n          existing_properties: existing?.properties ?? null,\n        },\n      },\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4032,
+        448
+      ],
+      "id": "0ee5c303-3fd4-493f-bcb3-21bcd9cb3a0d",
+      "name": "Attach Contact Search Result"
+    },
+    {
+      "parameters": {
+        "jsCode": "const compact = (object) =>\n  Object.fromEntries(\n    Object.entries(object).filter(([, value]) => value !== null && value !== undefined && value !== ''),\n  );\n\nreturn $input.all().map((item) => {\n  const inquiry = item.json;\n  const contact = inquiry.business?.contact ?? {};\n\n  const email = typeof contact.email === 'string'\n    ? contact.email.trim().toLowerCase()\n    : null;\n  const phone = typeof contact.phone === 'string'\n    ? contact.phone.trim()\n    : null;\n\n  if (!email && !phone) {\n    throw new Error('HubSpot Contact search requires a valid email or phone.');\n  }\n\n  const nameParts = typeof contact.name === 'string'\n    ? contact.name.trim().split(/\\s+/).filter(Boolean)\n    : [];\n  const firstName = nameParts.shift() ?? null;\n  const lastName = nameParts.length > 0 ? nameParts.join(' ') : null;\n\n  const matchProperty = email ? 'email' : 'phone';\n  const matchValue = email ?? phone;\n\n  const commonProperties = compact({\n    firstname: firstName,\n    lastname: lastName,\n    email,\n    phone,\n    city: contact.city,\n    state: contact.state,\n    construction_lead_source: inquiry.source,\n    construction_last_inquiry_at: inquiry.received_at,\n    construction_last_inquiry_id: inquiry.identity?.inquiry_id,\n  });\n\n  return {\n    json: {\n      ...inquiry,\n      hubspot: {\n        ...(inquiry.hubspot ?? {}),\n        status: 'contact_search_pending',\n        contact: {\n          match_property: matchProperty,\n          match_value: matchValue,\n          search_request: {\n            filterGroups: [\n              {\n                filters: [\n                  {\n                    propertyName: matchProperty,\n                    operator: 'EQ',\n                    value: matchValue,\n                  },\n                ],\n              },\n            ],\n            properties: [\n              'firstname',\n              'lastname',\n              'email',\n              'phone',\n              'city',\n              'state',\n              'construction_lead_source',\n              'construction_first_inquiry_at',\n              'construction_last_inquiry_at',\n              'construction_last_inquiry_id',\n            ],\n            limit: 2,\n          },\n          create_properties: {\n            ...commonProperties,\n            lifecyclestage: 'lead',\n            construction_first_inquiry_at: inquiry.received_at,\n          },\n          update_properties: commonProperties,\n        },\n      },\n    },\n  };\n});\n\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3584,
+        448
+      ],
+      "id": "70225398-e7ab-4950-8036-49488bcaf699",
+      "name": "Build HubSpot Contact Search"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotAppToken",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.hubspot.contact.search_request }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        3808,
+        448
+      ],
+      "id": "a69691ac-e53a-4f8f-961d-16057dbcd611",
+      "name": "Search HubSpot Contact",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "CONFIGURE_HUBSPOTAPPTOKEN",
+          "name": "CONFIGURE: HubSpot Service Key"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "4ea91f3f-3ef2-4217-b9d8-37701f1142e8",
+                    "leftValue": "={{ $json.hubspot.contact.search_status }}",
+                    "rightValue": "found",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Found"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "a52bca23-7088-466a-a50c-b98a0e97bead",
+                    "leftValue": "={{ $json.hubspot.contact.search_status }}",
+                    "rightValue": "not_found",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Not_Found"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "bacb11d0-e785-479b-a50f-331d8bf65ef2",
+                    "leftValue": "={{ $json.hubspot.contact.search_status }}",
+                    "rightValue": "multiple_matches",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Multiple_Matches"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "13b50aa8-7fbc-413a-8517-9b91365787a5",
+      "name": "Route Contact Match",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        4256,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ 'https://api.hubapi.com/crm/v3/objects/contacts/' + $json.hubspot.contact.contact_id }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotAppToken",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { properties: $json.hubspot.contact.update_properties } }}",
+        "options": {}
+      },
+      "id": "444b25e3-15f3-4305-998e-1e329e028429",
+      "name": "Update HubSpot Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        4480,
+        256
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "CONFIGURE_HUBSPOTAPPTOKEN",
+          "name": "CONFIGURE: HubSpot Service Key"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const searchItems = $('Attach Contact Search Result').all();\n\nreturn $input.all().map((item, index) => {\n  const original = searchItems[index]?.json;\n  if (!original) {\n    throw new Error(`Missing original inquiry for HubSpot Contact write item ${index}`);\n  }\n\n  if (item.json.error) {\n    return {\n      json: {\n        ...original,\n        hubspot: {\n          ...original.hubspot,\n          status: 'contact_write_error',\n          error: {\n            system: 'hubspot',\n            operation: original.hubspot.contact.search_status === 'found'\n              ? 'update_contact'\n              : 'create_contact',\n            message: item.json.error.message ?? String(item.json.error),\n            retry_exhausted: true,\n          },\n        },\n      },\n    };\n  }\n\n  const contactId = item.json.id;\n  if (!contactId) {\n    return {\n      json: {\n        ...original,\n        hubspot: {\n          ...original.hubspot,\n          status: 'contact_write_error',\n          error: {\n            system: 'hubspot',\n            operation: 'write_contact',\n            message: 'HubSpot Contact write response is missing an ID.',\n            retry_exhausted: false,\n          },\n        },\n      },\n    };\n  }\n\n  const wasExisting = original.hubspot.contact.search_status === 'found';\n\n  return {\n    json: {\n      ...original,\n      hubspot: {\n        ...original.hubspot,\n        status: wasExisting ? 'contact_updated' : 'contact_created',\n        contact: {\n          ...original.hubspot.contact,\n          contact_id: String(contactId),\n          write_operation: wasExisting ? 'updated' : 'created',\n          written_properties: item.json.properties ?? null,\n        },\n      },\n    },\n  };\n});"
+      },
+      "id": "d6d3ce3f-a07c-4d13-80d1-a64779d580d3",
+      "name": "Attach Contact Write Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4704,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotAppToken",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { properties: $json.hubspot.contact.create_properties } }}",
+        "options": {}
+      },
+      "id": "559ac701-49c4-4ea3-b986-961dafb9565a",
+      "name": "Create HubSpot Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        4480,
+        448
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "CONFIGURE_HUBSPOTAPPTOKEN",
+          "name": "CONFIGURE: HubSpot Service Key"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const compact = (object) => Object.fromEntries(\n  Object.entries(object).filter(([, value]) => value !== null && value !== undefined && value !== ''),\n);\n\nreturn $input.all().map((item) => {\n  const inquiry = item.json;\n  const deal = inquiry.business.deal;\n  const contactId = inquiry.hubspot.contact.contact_id;\n  if (!contactId) throw new Error('Cannot create a Deal without a HubSpot Contact ID.');\n\n  const properties = compact({\n    dealname: deal.name,\n    pipeline: deal.pipeline_id,\n    dealstage: deal.stage_id,\n    amount: deal.exact_budget_amount,\n    construction_inquiry_id: inquiry.identity.inquiry_id,\n    construction_source_event_id: inquiry.source_event_id,\n    construction_dedup_key: inquiry.identity.dedup_key,\n    construction_project_category: deal.category,\n    construction_service_requested: deal.service_requested,\n    construction_priority: inquiry.business.priority,\n    construction_lead_quality: deal.lead_quality,\n    construction_property_type: deal.property_type,\n    construction_timeline: deal.timeline,\n    construction_budget_range: deal.budget_range,\n    construction_city: deal.city,\n    construction_state: deal.state,\n    construction_next_action: inquiry.business.next_action,\n    construction_assigned_role: inquiry.business.assigned_role,\n    construction_ai_summary: deal.ai_summary,\n    construction_ai_confidence: deal.ai_confidence,\n    construction_missing_fields: JSON.stringify(deal.missing_fields),\n    construction_automation_status: 'crm_synced',\n    construction_received_at: inquiry.received_at,\n  });\n\n  return { json: { ...inquiry, hubspot: { ...inquiry.hubspot, status: 'deal_search_pending', deal: {\n    search_request: { filterGroups: [{ filters: [{ propertyName: 'construction_inquiry_id', operator: 'EQ', value: inquiry.identity.inquiry_id }] }], properties: Object.keys(properties), limit: 2 },\n    create_request: { properties, associations: [{ to: { id: String(contactId) }, types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 3 }] }] },\n  } } } };\n});"
+      },
+      "id": "3590dd03-62e7-4540-ae38-ef5abb945ebc",
+      "name": "Build HubSpot Deal Search",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5152,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/deals/search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotAppToken",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.hubspot.deal.search_request }}",
+        "options": {}
+      },
+      "id": "5e2673e9-225d-49de-a846-ba3c0553d911",
+      "name": "Search HubSpot Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        5376,
+        272
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "CONFIGURE_HUBSPOTAPPTOKEN",
+          "name": "CONFIGURE: HubSpot Service Key"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const originals = $('Build HubSpot Deal Search').all();\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing original inquiry for Deal search item ${index}`);\n  if (item.json.error) {\n    const { search_request, ...dealContext } = original.hubspot.deal;\n    return { json: { ...original, hubspot: { ...original.hubspot,\n      status: 'deal_search_error',\n      error: { system: 'hubspot', operation: 'search_deal', message: item.json.error.message ?? String(item.json.error), retry_exhausted: true },\n      deal: { ...dealContext, search_status: 'api_error', match_count: 0, deal_id: null },\n    } } };\n  }\n  const results = Array.isArray(item.json.results) ? item.json.results : [];\n  const status = results.length === 0 ? 'not_found' : results.length === 1 ? 'found' : 'multiple_matches';\n  const { search_request, ...dealContext } = original.hubspot.deal;\n  return { json: { ...original, hubspot: { ...original.hubspot, status: `deal_${status}`, deal: { ...dealContext, search_status: status, match_count: results.length, deal_id: results.length === 1 ? String(results[0].id) : null, existing_properties: results.length === 1 ? results[0].properties : null } } } };\n});"
+      },
+      "id": "77d4a9e2-74be-409d-a065-ce71858c5959",
+      "name": "Attach Deal Search Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5600,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "62691f43-e1fa-43f4-b285-9907e4df9dae",
+                    "leftValue": "={{ $json.hubspot.deal.search_status }}",
+                    "rightValue": "found",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "found"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "36b5f8e4-c5af-48c9-a957-cf5057931a28",
+                    "leftValue": "={{ $json.hubspot.deal.search_status }}",
+                    "rightValue": "not_found",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "not_found"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "20c3b44b-536f-4894-b908-3ab889936bdc",
+                    "leftValue": "={{ $json.hubspot.deal.search_status }}",
+                    "rightValue": "multiple_matches",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "multiple_matches"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "5d4731e0-4cdf-4755-89fc-9b126c549c1d",
+      "name": "Route Deal Match",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        5824,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/deals",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotAppToken",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.hubspot.deal.create_request }}",
+        "options": {}
+      },
+      "id": "139197d1-b69f-4ad7-ba92-d1ce3fa1da9b",
+      "name": "Create HubSpot Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        6048,
+        192
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "CONFIGURE_HUBSPOTAPPTOKEN",
+          "name": "CONFIGURE: HubSpot Service Key"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const originals = $('Attach Deal Search Result').all();\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing original inquiry for Deal write item ${index}`);\n  if (item.json.error || !item.json.id) {\n    return { json: { ...original, hubspot: { ...original.hubspot,\n      status: 'deal_write_error',\n      error: { system: 'hubspot', operation: 'create_deal', message: item.json.error?.message ?? 'HubSpot Deal create response is missing an ID.', retry_exhausted: Boolean(item.json.error) },\n    } } };\n  }\n  return { json: { ...original, hubspot: { ...original.hubspot, status: 'crm_synced', deal: { ...original.hubspot.deal, deal_id: String(item.json.id), write_operation: 'created', written_properties: item.json.properties ?? null } } } };\n});"
+      },
+      "id": "ea50e993-78e9-4eb7-aa75-d7146975c849",
+      "name": "Attach Deal Write Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6272,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "1bb93ab5-2761-48bc-a1b3-82ded212f454",
+                    "leftValue": "={{ $json.hubspot.status }}",
+                    "rightValue": "contact_write_error",
+                    "operator": {
+                      "type": "string",
+                      "operation": "notEquals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "success"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "780f41cc-aee6-4953-a906-d4f5f1f3baef",
+      "name": "Route Contact Write",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        4928,
+        352
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const safeError = (value) => {\n  if (!value) return null;\n  if (typeof value === 'string') return value;\n  return value.message ?? JSON.stringify(value);\n};\n\nreturn $input.all().map((item) => {\n  const inquiry = item.json;\n  const validationDisposition = inquiry.validation?.disposition;\n  const aiDisposition = inquiry.ai?.validation?.disposition;\n  const contactStatus = inquiry.hubspot?.contact?.search_status;\n  const dealStatus = inquiry.hubspot?.deal?.search_status;\n  const integrationError = inquiry.hubspot?.error ?? inquiry.ai?.error ?? null;\n\n  let automationStatus = 'manual_review';\n  let responseStatus = 'manual_review';\n  let responseCode = 202;\n  let message = 'Inquiry was saved for manual review.';\n\n  if (inquiry.hubspot?.status === 'crm_synced') {\n    automationStatus = 'completed';\n    responseStatus = 'accepted';\n    message = 'Inquiry was classified and synchronized to HubSpot.';\n  } else if (dealStatus === 'found') {\n    automationStatus = 'completed_existing_deal';\n    responseStatus = 'accepted';\n    message = 'The existing HubSpot Deal was reused; no duplicate Deal was created.';\n  } else if (aiDisposition === 'stop_no_crm') {\n    automationStatus = 'stopped_no_crm';\n    responseStatus = 'filtered';\n    responseCode = 200;\n    message = 'Inquiry was classified as spam or not a fit; CRM creation was skipped.';\n  } else if (integrationError) {\n    automationStatus = 'integration_error';\n    responseStatus = 'manual_review';\n    message = 'Inquiry was saved, but an external service failed after retries; manual follow-up is required.';\n  } else if (contactStatus === 'multiple_matches') {\n    automationStatus = 'contact_match_review';\n    message = 'Multiple Contacts matched; no CRM write was attempted.';\n  } else if (dealStatus === 'multiple_matches') {\n    automationStatus = 'deal_match_review';\n    message = 'Multiple Deals matched; no Deal was created.';\n  } else if (validationDisposition === 'manual_review') {\n    automationStatus = 'intake_manual_review';\n    message = 'Inquiry was saved because its contact information needs review.';\n  } else if (aiDisposition === 'manual_review') {\n    automationStatus = inquiry.ai?.status === 'failed' ? 'ai_error' : 'ai_manual_review';\n    message = inquiry.ai?.status === 'failed'\n      ? 'AI classification failed after retries; the inquiry was saved for manual review.'\n      : 'AI confidence or schema validation requires manual review.';\n  }\n\n  const completedAt = new Date().toISOString();\n  const errorMessage = safeError(integrationError);\n  const response = {\n    status: responseStatus,\n    inquiry_id: inquiry.identity?.inquiry_id ?? null,\n    source_event_id: inquiry.source_event_id ?? null,\n    automation_status: automationStatus,\n    hubspot_contact_id: inquiry.hubspot?.contact?.contact_id ?? null,\n    hubspot_deal_id: inquiry.hubspot?.deal?.deal_id ?? null,\n    message,\n  };\n\n  return {\n    json: {\n      ...inquiry,\n      finalization: {\n        automation_status: automationStatus,\n        ai_status: inquiry.ai?.status ?? 'not_run',\n        ai_result_json: JSON.stringify(inquiry.ai?.result ?? null),\n        hubspot_contact_id: response.hubspot_contact_id,\n        hubspot_deal_id: response.hubspot_deal_id,\n        last_error: errorMessage,\n        completed_at: completedAt,\n        result_json: JSON.stringify({\n          automation_status: automationStatus,\n          ai: inquiry.ai ?? null,\n          business: inquiry.business ?? null,\n          hubspot: inquiry.hubspot ?? null,\n        }),\n        response_code: responseCode,\n        response,\n      },\n    },\n  };\n});"
+      },
+      "id": "93250b1f-8e0e-41d2-ae79-f0e38cae9100",
+      "name": "Prepare Final Outcome",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6496,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "inquiry_id",
+              "keyValue": "={{ $json.identity.inquiry_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "automation_status": "={{ $json.finalization.automation_status }}",
+            "ai_status": "={{ $json.finalization.ai_status }}",
+            "ai_result_json": "={{ $json.finalization.ai_result_json }}",
+            "hubspot_contact_id": "={{ $json.finalization.hubspot_contact_id ?? \"\" }}",
+            "hubspot_deal_id": "={{ $json.finalization.hubspot_deal_id ?? \"\" }}",
+            "last_error": "={{ $json.finalization.last_error ?? \"\" }}",
+            "completed_at": "={{ $json.finalization.completed_at }}",
+            "result_json": "={{ $json.finalization.result_json }}",
+            "correlation_id": "={{ $json.operations.correlation_id }}",
+            "execution_id": "={{ $json.operations.execution_id }}",
+            "processing_stage": "={{ $json.operations.processing_stage }}",
+            "processing_started_at": "={{ $json.operations.processing_started_at }}",
+            "processing_finished_at": "={{ $json.operations.processing_finished_at }}",
+            "processing_duration_ms": "={{ $json.operations.processing_duration_ms }}",
+            "last_successful_stage": "={{ $json.operations.last_successful_stage }}",
+            "error_stage": "={{ $json.operations.error_stage ?? \"\" }}",
+            "error_category": "={{ $json.operations.error_category ?? \"\" }}",
+            "dead_letter_id": "={{ $json.operations.dead_letter_id ?? \"\" }}",
+            "reprocessing_status": "={{ $json.operations.reprocessing_status }}",
+            "reprocessing_attempt_count": "={{ $json.operations.reprocessing_attempt_count }}",
+            "last_reprocessed_at": "={{ $json.operations.last_reprocessed_at ?? \"\" }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "dedup_key",
+              "displayName": "dedup_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "inquiry_id",
+              "displayName": "inquiry_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_event_id",
+              "displayName": "source_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "disposition",
+              "displayName": "disposition",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "received_at",
+              "displayName": "received_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "stored_at",
+              "displayName": "stored_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "payload_json",
+              "displayName": "payload_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "automation_status",
+              "displayName": "automation_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_status",
+              "displayName": "ai_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_result_json",
+              "displayName": "ai_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_contact_id",
+              "displayName": "hubspot_contact_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_deal_id",
+              "displayName": "hubspot_deal_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_error",
+              "displayName": "last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "completed_at",
+              "displayName": "completed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "result_json",
+              "displayName": "result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_status",
+              "displayName": "ack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_message_type",
+              "displayName": "ack_message_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_sent_at",
+              "displayName": "ack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_status",
+              "displayName": "slack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_sent_at",
+              "displayName": "slack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_status",
+              "displayName": "followup_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_due_at",
+              "displayName": "followup_due_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_sent_at",
+              "displayName": "followup_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_last_error",
+              "displayName": "communication_last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_result_json",
+              "displayName": "communication_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "correlation_id",
+              "displayName": "correlation_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "execution_id",
+              "displayName": "execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_stage",
+              "displayName": "processing_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_started_at",
+              "displayName": "processing_started_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_finished_at",
+              "displayName": "processing_finished_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_duration_ms",
+              "displayName": "processing_duration_ms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_successful_stage",
+              "displayName": "last_successful_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_stage",
+              "displayName": "error_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_category",
+              "displayName": "error_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "dead_letter_id",
+              "displayName": "dead_letter_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_status",
+              "displayName": "reprocessing_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_attempt_count",
+              "displayName": "reprocessing_attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_reprocessed_at",
+              "displayName": "last_reprocessed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "c8b046fe-842b-453b-94d4-294eb2030db8",
+      "name": "Persist Final Outcome",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        6720,
+        576
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const originals = $('Prepare Operational Completion').all();\n\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing V4 final outcome context for item ${index}`);\n  return {\n    json: {\n      ...original,\n      finalization: {\n        ...original.finalization,\n        persisted: !item.json.error,\n        persistence_error: item.json.error?.message ?? null,\n      },\n    },\n  };\n});"
+      },
+      "id": "f82e1252-e3bd-461c-8695-5f73346075b3",
+      "name": "Restore Final Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6944,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "enableResponseOutput": true,
+        "respondWith": "json",
+        "responseBody": "={{ $json.finalization.response }}",
+        "options": {
+          "responseCode": "={{ $json.finalization.response_code }}"
+        }
+      },
+      "id": "ba6f6cd2-d87e-4252-a3b9-0b5f4379d899",
+      "name": "Respond - Final Outcome",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        7168,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const TEST_RECIPIENT = 'YOUR_CONTROLLED_TEST_EMAIL@example.com';\nconst TEST_MODE = true;\nconst TEST_FOLLOWUP_DELAY_MINUTES = null;\nconst emailPattern = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n\nreturn $input.all().map((item) => {\n  const inquiry = item.json;\n  const status = inquiry.finalization?.automation_status ?? 'unknown';\n  const customer = inquiry.business?.contact ?? inquiry.customer ?? {};\n  const intendedEmail = typeof customer.email === 'string' && emailPattern.test(customer.email)\n    ? customer.email.toLowerCase()\n    : null;\n  const completed = ['completed', 'completed_existing_deal'].includes(status);\n  const review = ['integration_error', 'ai_error', 'ai_manual_review', 'intake_manual_review', 'contact_match_review', 'deal_match_review'].includes(status);\n  const emailEligible = Boolean(intendedEmail && (completed || review));\n\n  let messageType = 'safe_fallback';\n  if (completed) messageType = inquiry.business?.acknowledgment_type ?? 'standard';\n\n  const name = customer.name?.trim() || 'there';\n  const service = inquiry.business?.deal?.service_requested || inquiry.ai?.result?.project?.service_requested || 'your project';\n  const missingFields = inquiry.business?.deal?.missing_fields ?? inquiry.ai?.result?.missing_fields ?? [];\n  const missingText = missingFields.length ? missingFields.join(', ') : 'a few project details';\n\n  const templates = {\n    urgent: {\n      subject: `Urgent inquiry received: ${service}`,\n      body: `Hi ${name},\\n\\nWe received your inquiry about ${service} and marked it as urgent for priority review. A team member will review the information you provided and contact you using the details in your inquiry.\\n\\nReference: ${inquiry.identity?.inquiry_id}\\n\\nSummit Ridge Renovations`,\n    },\n    missing_info: {\n      subject: `More information requested for ${service}`,\n      body: `Hi ${name},\\n\\nThank you for contacting Summit Ridge Renovations about ${service}. To prepare the next step, please reply with the following information: ${missingText}.\\n\\nReference: ${inquiry.identity?.inquiry_id}\\n\\nSummit Ridge Renovations`,\n    },\n    standard: {\n      subject: `We received your inquiry about ${service}`,\n      body: `Hi ${name},\\n\\nThank you for contacting Summit Ridge Renovations. We received your inquiry about ${service} and will review the project details before following up.\\n\\nReference: ${inquiry.identity?.inquiry_id}\\n\\nSummit Ridge Renovations`,\n    },\n    safe_fallback: {\n      subject: 'Your inquiry was received',\n      body: `Hi ${name},\\n\\nThank you for contacting Summit Ridge Renovations. Your inquiry was received and saved for review. A team member will check the details before contacting you.\\n\\nReference: ${inquiry.identity?.inquiry_id}\\n\\nSummit Ridge Renovations`,\n    },\n  };\n  const selected = templates[messageType] ?? templates.safe_fallback;\n\n  const priority = inquiry.business?.priority ?? 'review';\n  const slackEligible = ['urgent', 'high'].includes(priority) || review;\n  const slackReason = review ? status : `${priority}_priority`;\n  const slackText = [\n    `*Construction inquiry: ${slackReason}*`,\n    `Inquiry: ${inquiry.identity?.inquiry_id ?? 'unknown'}`,\n    `Customer: ${customer.name ?? 'Unknown'} (${intendedEmail ?? customer.phone ?? 'no contact method'})`,\n    `Service: ${service}`,\n    `Priority: ${priority}`,\n    `Next action: ${inquiry.business?.next_action ?? 'manual_review'}`,\n    `Assigned role: ${inquiry.business?.assigned_role ?? 'office_coordinator'}`,\n    `HubSpot Contact: ${inquiry.hubspot?.contact?.contact_id ?? 'not created'}`,\n    `HubSpot Deal: ${inquiry.hubspot?.deal?.deal_id ?? 'not created'}`,\n    inquiry.finalization?.last_error ? `Error: ${inquiry.finalization.last_error}` : null,\n  ].filter(Boolean).join('\\n');\n\n  const followupEligible = Boolean(completed && intendedEmail && inquiry.hubspot?.deal?.deal_id);\n  const followupHours = ['urgent', 'high'].includes(priority) ? 24 : 48;\n  const followupDelayMs = TEST_FOLLOWUP_DELAY_MINUTES === null\n    ? followupHours * 60 * 60 * 1000\n    : TEST_FOLLOWUP_DELAY_MINUTES * 60 * 1000;\n  const followupDueAt = followupEligible\n    ? new Date(Date.now() + followupDelayMs).toISOString()\n    : null;\n\n  return {\n    json: {\n      ...inquiry,\n      communication: {\n        mode: TEST_MODE ? 'test_override' : 'production',\n        email: {\n          eligible: emailEligible,\n          route: emailEligible ? 'send' : 'skip',\n          status: emailEligible ? 'pending' : 'not_eligible',\n          message_type: messageType,\n          intended_recipient: intendedEmail,\n          to: TEST_MODE ? TEST_RECIPIENT : intendedEmail,\n          subject: selected.subject,\n          body: selected.body,\n          sent_at: null,\n          provider_message_id: null,\n          error: null,\n        },\n        slack: {\n          eligible: slackEligible,\n          route: slackEligible ? 'send' : 'skip',\n          status: slackEligible ? 'pending' : 'not_eligible',\n          channel_id: 'CONFIGURE_SLACK_CHANNEL_ID',\n          text: slackText,\n          sent_at: null,\n          provider_message_id: null,\n          error: null,\n        },\n        followup: {\n          eligible: followupEligible,\n          route: followupEligible ? 'wait' : 'skip',\n          status: followupEligible ? 'scheduled' : 'not_eligible',\n          due_at: followupDueAt,\n          sent_at: null,\n          subject: `Following up on ${service}`,\n          body: `Hi ${name},\\n\\nWe are following up on your inquiry about ${service}. If you have additional information or questions, please reply to this email and our team will add it to your project record.\\n\\nReference: ${inquiry.identity?.inquiry_id}\\n\\nSummit Ridge Renovations`,\n          current_deal_stage: null,\n          error: null,\n        },\n      },\n    },\n  };\n});"
+      },
+      "id": "dedc2218-ddcc-4749-9cf8-cb1aa6cd467e",
+      "name": "Prepare Communication",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7392,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "cdb8ca05-2f34-45a9-939e-3d7f9809d5c3",
+                    "leftValue": "={{ $json.communication.email.route }}",
+                    "rightValue": "send",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "send"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "997dd03e-1aea-4235-8b48-35ad0c1cf68e",
+      "name": "Route Email Eligibility",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        7616,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.communication.email.to }}",
+        "subject": "={{ $json.communication.email.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.communication.email.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "fbd4b711-4143-493a-860a-808bba24dfae",
+      "name": "Send Gmail Acknowledgment",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        7840,
+        672
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "CONFIGURE_GMAILOAUTH2",
+          "name": "CONFIGURE: Gmail OAuth2"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const originals = $('Prepare Communication').all();\n\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing communication context for Gmail item ${index}`);\n  const failed = Boolean(item.json.error);\n  return {\n    json: {\n      ...original,\n      communication: {\n        ...original.communication,\n        email: {\n          ...original.communication.email,\n          status: failed ? 'failed' : 'sent',\n          sent_at: failed ? null : new Date().toISOString(),\n          provider_message_id: failed ? null : String(item.json.id ?? item.json.messageId ?? ''),\n          error: failed ? (item.json.error.message ?? String(item.json.error)) : null,\n        },\n      },\n    },\n  };\n});"
+      },
+      "id": "e565283c-b8d8-4e53-b2f4-460320951fc9",
+      "name": "Attach Gmail Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8064,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({\n  json: {\n    ...item.json,\n    communication: {\n      ...item.json.communication,\n      email: { ...item.json.communication.email, status: 'not_eligible' },\n    },\n  },\n}));"
+      },
+      "id": "f32e92cf-942f-4dde-baf6-fed576c2ebbf",
+      "name": "Mark Email Skipped",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7840,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "ec037774-80cb-49e4-8210-a36357ef6a22",
+                    "leftValue": "={{ $json.communication.slack.route }}",
+                    "rightValue": "send",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "send"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "a9650b9a-952f-4a96-a03a-9c9051bfdf1a",
+      "name": "Route Slack Eligibility",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        8288,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "CONFIGURE_SLACK_CHANNEL_ID",
+          "mode": "id"
+        },
+        "text": "={{ $json.communication.slack.text }}",
+        "otherOptions": {
+          "includeLinkToWorkflow": false
+        }
+      },
+      "id": "5391d85e-ae0d-4291-b8e1-ee0643c38875",
+      "name": "Send Slack Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.5,
+      "position": [
+        8512,
+        672
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "slackApi": {
+          "id": "CONFIGURE_SLACKAPI",
+          "name": "CONFIGURE: Slack API"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const originals = $('Route Slack Eligibility').all();\n\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing communication context for Slack item ${index}`);\n  const failed = Boolean(item.json.error) || item.json.ok === false;\n  return {\n    json: {\n      ...original,\n      communication: {\n        ...original.communication,\n        slack: {\n          ...original.communication.slack,\n          status: failed ? 'failed' : 'sent',\n          sent_at: failed ? null : new Date().toISOString(),\n          provider_message_id: failed ? null : String(item.json.ts ?? item.json.message?.ts ?? ''),\n          error: failed ? (item.json.error?.message ?? item.json.error ?? 'Slack returned an unsuccessful response') : null,\n        },\n      },\n    },\n  };\n});"
+      },
+      "id": "30026223-53f5-46bf-81f2-9dd61dea5632",
+      "name": "Attach Slack Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8736,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({\n  json: {\n    ...item.json,\n    communication: {\n      ...item.json.communication,\n      slack: { ...item.json.communication.slack, status: 'not_eligible' },\n    },\n  },\n}));"
+      },
+      "id": "1db48a8a-d1f2-454c-a9e6-8f7fdfef8f6c",
+      "name": "Mark Slack Skipped",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8512,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => {\n  const inquiry = item.json;\n  const errors = [inquiry.communication?.email?.error, inquiry.communication?.slack?.error].filter(Boolean);\n  return {\n    json: {\n      ...inquiry,\n      communication_persistence: {\n        ack_status: inquiry.communication.email.status,\n        ack_message_type: inquiry.communication.email.message_type,\n        ack_sent_at: inquiry.communication.email.sent_at ?? '',\n        slack_status: inquiry.communication.slack.status,\n        slack_sent_at: inquiry.communication.slack.sent_at ?? '',\n        followup_status: inquiry.communication.followup.status,\n        followup_due_at: inquiry.communication.followup.due_at ?? '',\n        followup_sent_at: inquiry.communication.followup.sent_at ?? '',\n        communication_last_error: errors.join(' | '),\n        communication_result_json: JSON.stringify(inquiry.communication),\n      },\n    },\n  };\n});"
+      },
+      "id": "e5808f83-ea2f-4e50-a566-09dd1d168f10",
+      "name": "Prepare Communication Persistence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8960,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "inquiry_id",
+              "keyValue": "={{ $json.identity.inquiry_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "ack_status": "={{ $json.communication_persistence.ack_status }}",
+            "ack_message_type": "={{ $json.communication_persistence.ack_message_type }}",
+            "ack_sent_at": "={{ $json.communication_persistence.ack_sent_at }}",
+            "slack_status": "={{ $json.communication_persistence.slack_status }}",
+            "slack_sent_at": "={{ $json.communication_persistence.slack_sent_at }}",
+            "followup_status": "={{ $json.communication_persistence.followup_status }}",
+            "followup_due_at": "={{ $json.communication_persistence.followup_due_at }}",
+            "followup_sent_at": "={{ $json.communication_persistence.followup_sent_at }}",
+            "communication_last_error": "={{ $json.communication_persistence.communication_last_error }}",
+            "communication_result_json": "={{ $json.communication_persistence.communication_result_json }}",
+            "processing_stage": "={{ $json.communication.followup.status === \"scheduled\" ? \"waiting_followup\" : \"communication_completed\" }}",
+            "processing_finished_at": "={{ $now.toUTC().toISO() }}",
+            "processing_duration_ms": "={{ Math.max(0, Date.now() - Date.parse($json.operations.processing_started_at)) }}",
+            "last_successful_stage": "communication_persisted",
+            "error_stage": "={{ $json.communication_persistence.communication_last_error ? \"communication\" : \"\" }}",
+            "error_category": "={{ $json.communication_persistence.communication_last_error ? \"provider_communication\" : \"\" }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "dedup_key",
+              "displayName": "dedup_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "inquiry_id",
+              "displayName": "inquiry_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_event_id",
+              "displayName": "source_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "disposition",
+              "displayName": "disposition",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "received_at",
+              "displayName": "received_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "stored_at",
+              "displayName": "stored_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "payload_json",
+              "displayName": "payload_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "automation_status",
+              "displayName": "automation_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_status",
+              "displayName": "ai_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_result_json",
+              "displayName": "ai_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_contact_id",
+              "displayName": "hubspot_contact_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_deal_id",
+              "displayName": "hubspot_deal_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_error",
+              "displayName": "last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "completed_at",
+              "displayName": "completed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "result_json",
+              "displayName": "result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_status",
+              "displayName": "ack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_message_type",
+              "displayName": "ack_message_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_sent_at",
+              "displayName": "ack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_status",
+              "displayName": "slack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_sent_at",
+              "displayName": "slack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_status",
+              "displayName": "followup_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_due_at",
+              "displayName": "followup_due_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_sent_at",
+              "displayName": "followup_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_last_error",
+              "displayName": "communication_last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_result_json",
+              "displayName": "communication_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "correlation_id",
+              "displayName": "correlation_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "execution_id",
+              "displayName": "execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_stage",
+              "displayName": "processing_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_started_at",
+              "displayName": "processing_started_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_finished_at",
+              "displayName": "processing_finished_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_duration_ms",
+              "displayName": "processing_duration_ms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_successful_stage",
+              "displayName": "last_successful_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_stage",
+              "displayName": "error_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_category",
+              "displayName": "error_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "dead_letter_id",
+              "displayName": "dead_letter_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_status",
+              "displayName": "reprocessing_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_attempt_count",
+              "displayName": "reprocessing_attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_reprocessed_at",
+              "displayName": "last_reprocessed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "081caa50-b11a-4e08-9b3b-cf6fd363e0d3",
+      "name": "Persist Communication Outcome",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        9184,
+        736
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const originals = $('Prepare Communication Persistence').all();\nreturn $input.all().map((item, index) => ({\n  json: {\n    ...originals[index].json,\n    communication_persistence: {\n      ...originals[index].json.communication_persistence,\n      persisted: !item.json.error,\n      persistence_error: item.json.error?.message ?? null,\n    },\n  },\n}));"
+      },
+      "id": "47e036ff-6c40-4953-a508-32de367edf75",
+      "name": "Restore Communication Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        9408,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "d200efa7-3508-48ac-8367-f410db5762eb",
+                    "leftValue": "={{ $json.communication.followup.route }}",
+                    "rightValue": "wait",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "wait"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "657ef725-acde-4b1a-9c5b-df9a9165b4cf",
+      "name": "Route Follow-Up Eligibility",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        9632,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "resume": "specificTime",
+        "dateTime": "={{ $json.communication.followup.due_at }}"
+      },
+      "id": "e6834dc4-5280-4d32-8202-46713ee71d05",
+      "name": "Wait for Follow-Up",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        9856,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ 'https://api.hubapi.com/crm/v3/objects/deals/' + $json.hubspot.deal.deal_id + '?properties=dealstage,pipeline' }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotAppToken",
+        "options": {}
+      },
+      "id": "20fc750f-9fe2-4fd1-86b6-81a05ea26cda",
+      "name": "Get HubSpot Deal for Follow-Up",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        10080,
+        672
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "hubspotAppToken": {
+          "id": "CONFIGURE_HUBSPOTAPPTOKEN",
+          "name": "CONFIGURE: HubSpot Service Key"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const originals = $('Wait for Follow-Up').all();\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing follow-up context for Deal item ${index}`);\n  if (item.json.error) {\n    return { json: { ...original, communication: { ...original.communication, followup: {\n      ...original.communication.followup,\n      route: 'failed',\n      status: 'failed',\n      error: item.json.error.message ?? String(item.json.error),\n    } } } };\n  }\n  const stage = item.json.properties?.dealstage ?? null;\n  const shouldSend = stage === 'appointmentscheduled';\n  return { json: { ...original, communication: { ...original.communication, followup: {\n    ...original.communication.followup,\n    current_deal_stage: stage,\n    route: shouldSend ? 'send' : 'suppress',\n    status: shouldSend ? 'pending_send' : 'suppressed',\n  } } } };\n});"
+      },
+      "id": "b5224408-48bd-4d3d-b1f3-dd9f1107b753",
+      "name": "Attach Follow-Up Deal Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10304,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "49229c9b-46b6-491d-8e20-97503c714da3",
+                    "leftValue": "={{ $json.communication.followup.route }}",
+                    "rightValue": "send",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "send"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "b0aebc65-8611-4c24-99d4-d97a162d8909",
+                    "leftValue": "={{ $json.communication.followup.route }}",
+                    "rightValue": "suppress",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "suppress"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "id": "c0584864-53d0-4218-bad9-94473eb924bc",
+      "name": "Route Follow-Up Decision",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        10528,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $json.communication.email.to }}",
+        "subject": "={{ $json.communication.followup.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.communication.followup.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "def78ec1-9572-4b3e-8a92-9ca8bf49d4f9",
+      "name": "Send Gmail Follow-Up",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        10752,
+        576
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "CONFIGURE_GMAILOAUTH2",
+          "name": "CONFIGURE: Gmail OAuth2"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const originals = $('Route Follow-Up Decision').all();\nreturn $input.all().map((item, index) => {\n  const original = originals[index]?.json;\n  if (!original) throw new Error(`Missing follow-up send context for item ${index}`);\n  const failed = Boolean(item.json.error);\n  return { json: { ...original, communication: { ...original.communication, followup: {\n    ...original.communication.followup,\n    status: failed ? 'failed' : 'sent',\n    sent_at: failed ? null : new Date().toISOString(),\n    provider_message_id: failed ? null : String(item.json.id ?? item.json.messageId ?? ''),\n    error: failed ? (item.json.error.message ?? String(item.json.error)) : null,\n  } } } };\n});"
+      },
+      "id": "e301c6c6-b0a5-4b09-a5bd-7b155afeef91",
+      "name": "Attach Follow-Up Gmail Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10976,
+        576
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: {\n  ...item.json,\n  communication: { ...item.json.communication, followup: {\n    ...item.json.communication.followup,\n    status: 'suppressed',\n    sent_at: null,\n  } },\n} }));"
+      },
+      "id": "146996d5-3c2e-418e-9924-9629c9f4ff3d",
+      "name": "Mark Follow-Up Suppressed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10752,
+        736
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => ({ json: {\n  ...item.json,\n  communication: { ...item.json.communication, followup: {\n    ...item.json.communication.followup,\n    status: 'failed',\n  } },\n} }));"
+      },
+      "id": "a7621803-1752-43e1-982a-908892974538",
+      "name": "Mark Follow-Up Failed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        10752,
+        896
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => {\n  const inquiry = item.json;\n  const errors = [\n    inquiry.communication?.email?.error,\n    inquiry.communication?.slack?.error,\n    inquiry.communication?.followup?.error,\n  ].filter(Boolean);\n  return { json: { ...inquiry, followup_persistence: {\n    followup_status: inquiry.communication.followup.status,\n    followup_due_at: inquiry.communication.followup.due_at ?? '',\n    followup_sent_at: inquiry.communication.followup.sent_at ?? '',\n    communication_last_error: errors.join(' | '),\n    communication_result_json: JSON.stringify(inquiry.communication),\n  } } };\n});"
+      },
+      "id": "6cf450f5-5aae-4d40-b1f2-51ae3c24290d",
+      "name": "Prepare Follow-Up Persistence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        11200,
+        672
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "CONFIGURE_DATA_TABLE",
+          "mode": "list",
+          "cachedResultName": "construction_inquiries_v4"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "inquiry_id",
+              "keyValue": "={{ $json.identity.inquiry_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "followup_status": "={{ $json.followup_persistence.followup_status }}",
+            "followup_due_at": "={{ $json.followup_persistence.followup_due_at }}",
+            "followup_sent_at": "={{ $json.followup_persistence.followup_sent_at }}",
+            "communication_last_error": "={{ $json.followup_persistence.communication_last_error }}",
+            "communication_result_json": "={{ $json.followup_persistence.communication_result_json }}",
+            "processing_stage": "={{ \"followup_\" + $json.followup_persistence.followup_status }}",
+            "processing_finished_at": "={{ $now.toUTC().toISO() }}",
+            "processing_duration_ms": "={{ Math.max(0, Date.now() - Date.parse($json.operations.processing_started_at)) }}",
+            "last_successful_stage": "={{ $json.followup_persistence.followup_status === \"failed\" ? \"followup_decision\" : \"followup_persisted\" }}",
+            "error_stage": "={{ $json.followup_persistence.communication_last_error ? \"followup\" : \"\" }}",
+            "error_category": "={{ $json.followup_persistence.communication_last_error ? \"provider_communication\" : \"\" }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "dedup_key",
+              "displayName": "dedup_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "inquiry_id",
+              "displayName": "inquiry_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "source_event_id",
+              "displayName": "source_event_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "disposition",
+              "displayName": "disposition",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "received_at",
+              "displayName": "received_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "stored_at",
+              "displayName": "stored_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "payload_json",
+              "displayName": "payload_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "automation_status",
+              "displayName": "automation_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_status",
+              "displayName": "ai_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ai_result_json",
+              "displayName": "ai_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_contact_id",
+              "displayName": "hubspot_contact_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "hubspot_deal_id",
+              "displayName": "hubspot_deal_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_error",
+              "displayName": "last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "completed_at",
+              "displayName": "completed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "result_json",
+              "displayName": "result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_status",
+              "displayName": "ack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_message_type",
+              "displayName": "ack_message_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "ack_sent_at",
+              "displayName": "ack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_status",
+              "displayName": "slack_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "slack_sent_at",
+              "displayName": "slack_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_status",
+              "displayName": "followup_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_due_at",
+              "displayName": "followup_due_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "followup_sent_at",
+              "displayName": "followup_sent_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_last_error",
+              "displayName": "communication_last_error",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "communication_result_json",
+              "displayName": "communication_result_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "correlation_id",
+              "displayName": "correlation_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "execution_id",
+              "displayName": "execution_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_stage",
+              "displayName": "processing_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_started_at",
+              "displayName": "processing_started_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_finished_at",
+              "displayName": "processing_finished_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "processing_duration_ms",
+              "displayName": "processing_duration_ms",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_successful_stage",
+              "displayName": "last_successful_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_stage",
+              "displayName": "error_stage",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "error_category",
+              "displayName": "error_category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "dead_letter_id",
+              "displayName": "dead_letter_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_status",
+              "displayName": "reprocessing_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reprocessing_attempt_count",
+              "displayName": "reprocessing_attempt_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "last_reprocessed_at",
+              "displayName": "last_reprocessed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "4baa7b30-c730-4d55-888b-5af987639d8e",
+      "name": "Persist Follow-Up Outcome",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        11424,
+        672
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 500,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "460b610c-0a9d-4c70-8ddc-0b408414d3be",
+      "name": "Prepare Operational Completion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6720,
+        640
+      ],
+      "parameters": {
+        "jsCode": "return $input.all().map((item) => {\n  const inquiry = item.json;\n  const finishedAt = new Date().toISOString();\n  const startedAt = inquiry.operations?.processing_started_at ?? finishedAt;\n  const duration = Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt));\n  const status = inquiry.finalization?.automation_status ?? 'unknown';\n  const error = inquiry.hubspot?.error ?? inquiry.ai?.error ?? null;\n\n  let processingStage = 'core_processing_completed';\n  let lastSuccessfulStage = 'final_outcome_prepared';\n  if (status === 'stopped_no_crm') processingStage = 'filtered_no_crm';\n  if (status.includes('manual_review')) processingStage = 'manual_review';\n  if (['integration_error', 'ai_error'].includes(status)) processingStage = 'external_failure_handled';\n\n  return {\n    json: {\n      ...inquiry,\n      operations: {\n        ...inquiry.operations,\n        processing_stage: processingStage,\n        processing_finished_at: finishedAt,\n        processing_duration_ms: duration,\n        last_successful_stage: lastSuccessfulStage,\n        error_stage: error?.operation ?? null,\n        error_category: error ? 'external_service' : null,\n      },\n    },\n  };\n});"
+      }
+    }
+  ],
+  "connections": {
+    "Receive Enquiry": {
+      "main": [
+        [
+          {
+            "node": "Normalize Inquiry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Inquiry": {
+      "main": [
+        [
+          {
+            "node": "Validate Enquiry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Enquiry": {
+      "main": [
+        [
+          {
+            "node": "Generate Identity",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route by dispostion": {
+      "main": [
+        [
+          {
+            "node": "Check Duplicate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Check New Inquiry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond - Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Check Duplicate",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Check New Inquiry",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond - Routing Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Identity": {
+      "main": [
+        [
+          {
+            "node": "Route by dispostion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Duplicate": {
+      "main": [
+        [
+          {
+            "node": "Respond Duplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check New Inquiry": {
+      "main": [
+        [
+          {
+            "node": "Store Intake",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond to Routing Error in Duplicate Checking": {
+      "main": [
+        []
+      ]
+    },
+    "Route New Inquiry": {
+      "main": [
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare AI Input",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond to Routing Error in Duplicate Checking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Intake": {
+      "main": [
+        [
+          {
+            "node": "Restore Inquiry Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Inquiry Context": {
+      "main": [
+        [
+          {
+            "node": "Route New Inquiry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare AI Input": {
+      "main": [
+        [
+          {
+            "node": "Build Groq Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Groq Request": {
+      "main": [
+        [
+          {
+            "node": "Classify Inquiry - Groq",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Inquiry - Groq": {
+      "main": [
+        [
+          {
+            "node": "Attach Groq Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Groq Result": {
+      "main": [
+        [
+          {
+            "node": "Validate AI Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate AI Result": {
+      "main": [
+        [
+          {
+            "node": "Rule AI Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Business Rules": {
+      "main": [
+        [
+          {
+            "node": "Build HubSpot Contact Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rule AI Outcome": {
+      "main": [
+        [
+          {
+            "node": "Add Business Rules",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Contact Search Result": {
+      "main": [
+        [
+          {
+            "node": "Route Contact Match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build HubSpot Contact Search": {
+      "main": [
+        [
+          {
+            "node": "Search HubSpot Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search HubSpot Contact": {
+      "main": [
+        [
+          {
+            "node": "Attach Contact Search Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Contact Match": {
+      "main": [
+        [
+          {
+            "node": "Update HubSpot Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create HubSpot Contact",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update HubSpot Contact": {
+      "main": [
+        [
+          {
+            "node": "Attach Contact Write Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Contact Write Result": {
+      "main": [
+        [
+          {
+            "node": "Route Contact Write",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create HubSpot Contact": {
+      "main": [
+        [
+          {
+            "node": "Attach Contact Write Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build HubSpot Deal Search": {
+      "main": [
+        [
+          {
+            "node": "Search HubSpot Deal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search HubSpot Deal": {
+      "main": [
+        [
+          {
+            "node": "Attach Deal Search Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Deal Search Result": {
+      "main": [
+        [
+          {
+            "node": "Route Deal Match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Deal Match": {
+      "main": [
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Create HubSpot Deal",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create HubSpot Deal": {
+      "main": [
+        [
+          {
+            "node": "Attach Deal Write Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Deal Write Result": {
+      "main": [
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Contact Write": {
+      "main": [
+        [
+          {
+            "node": "Build HubSpot Deal Search",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Final Outcome": {
+      "main": [
+        [
+          {
+            "node": "Prepare Operational Completion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Final Outcome": {
+      "main": [
+        [
+          {
+            "node": "Restore Final Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Final Context": {
+      "main": [
+        [
+          {
+            "node": "Respond - Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond - Final Outcome": {
+      "main": [
+        [
+          {
+            "node": "Prepare Communication",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Communication": {
+      "main": [
+        [
+          {
+            "node": "Route Email Eligibility",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Email Eligibility": {
+      "main": [
+        [
+          {
+            "node": "Send Gmail Acknowledgment",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Email Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Gmail Acknowledgment": {
+      "main": [
+        [
+          {
+            "node": "Attach Gmail Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Gmail Result": {
+      "main": [
+        [
+          {
+            "node": "Route Slack Eligibility",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Email Skipped": {
+      "main": [
+        [
+          {
+            "node": "Route Slack Eligibility",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Slack Eligibility": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Slack Skipped",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Attach Slack Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Slack Result": {
+      "main": [
+        [
+          {
+            "node": "Prepare Communication Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Slack Skipped": {
+      "main": [
+        [
+          {
+            "node": "Prepare Communication Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Communication Persistence": {
+      "main": [
+        [
+          {
+            "node": "Persist Communication Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Communication Outcome": {
+      "main": [
+        [
+          {
+            "node": "Restore Communication Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore Communication Context": {
+      "main": [
+        [
+          {
+            "node": "Route Follow-Up Eligibility",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Follow-Up Eligibility": {
+      "main": [
+        [
+          {
+            "node": "Wait for Follow-Up",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Wait for Follow-Up": {
+      "main": [
+        [
+          {
+            "node": "Get HubSpot Deal for Follow-Up",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get HubSpot Deal for Follow-Up": {
+      "main": [
+        [
+          {
+            "node": "Attach Follow-Up Deal Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Follow-Up Deal Result": {
+      "main": [
+        [
+          {
+            "node": "Route Follow-Up Decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Follow-Up Decision": {
+      "main": [
+        [
+          {
+            "node": "Send Gmail Follow-Up",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Follow-Up Suppressed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Follow-Up Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Gmail Follow-Up": {
+      "main": [
+        [
+          {
+            "node": "Attach Follow-Up Gmail Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Follow-Up Gmail Result": {
+      "main": [
+        [
+          {
+            "node": "Prepare Follow-Up Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Follow-Up Suppressed": {
+      "main": [
+        [
+          {
+            "node": "Prepare Follow-Up Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Follow-Up Failed": {
+      "main": [
+        [
+          {
+            "node": "Prepare Follow-Up Persistence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Follow-Up Persistence": {
+      "main": [
+        [
+          {
+            "node": "Persist Follow-Up Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Operational Completion": {
+      "main": [
+        [
+          {
+            "node": "Persist Final Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "errorWorkflow": "CONFIGURE_ERROR_WORKFLOW_ID"
+  },
+  "staticData": null,
+  "pinData": {},
+  "active": false,
+  "tags": [],
+  "isArchived": false,
+  "nodeGroups": [],
+  "sourceWorkflowId": null
+}
