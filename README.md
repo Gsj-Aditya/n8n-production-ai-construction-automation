@@ -37,26 +37,7 @@ Unexpected crashes invoke a separate Error Trigger workflow. Failed attempts bec
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    A[Website or trusted backend] -->|Header Auth| B[n8n V4 Intake]
-    B --> C[Validation and Deduplication]
-    C --> D[Groq Structured Classification]
-    D --> E[Deterministic Rules]
-    E --> F[HubSpot Contact and Deal]
-    F --> G[Gmail Acknowledgment]
-    G --> H[Slack Alert]
-    H --> I[Persistent Wait]
-    I --> J[HubSpot Stage Recheck]
-    J -->|Still New| K[Follow-Up Email]
-    J -->|Human Progress| L[Suppress Follow-Up]
-    B --> M[(Inquiry Lifecycle Table)]
-    B -. unexpected crash .-> N[Error Trigger Handler]
-    N --> O[(Dead-Letter Table)]
-    O --> P[Safe Reprocessor]
-    M --> Q[Operations Health and Trace]
-    O --> Q
-```
+![Architecture of the AI construction inquiry automation](assets/01-architecture.png)
 
 ## What I built
 
@@ -105,6 +86,16 @@ flowchart LR
 - Operations dashboard and correlation trace
 
 See [`docs/03-test-evidence.md`](docs/03-test-evidence.md).
+
+### Portfolio evidence
+
+#### Urgent inquiry classified and routed
+
+![Urgent inquiry business rules](assets/02-successful-inquiry.png)
+
+#### Failed Slack action recovered safely
+
+![Slack-only recovery resolved on the first attempt](assets/03-safe-recovery.png)
 
 ## Technology
 
