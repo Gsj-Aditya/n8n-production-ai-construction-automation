@@ -2,7 +2,7 @@
 
 An n8n portfolio project that turns inbound construction inquiries into validated, AI-enriched, traceable CRM opportunities with customer acknowledgment, internal alerts, controlled follow-up, centralized error handling, and safe recovery.
 
-> Demo video: add the final Loom URL here.
+**[Watch the demo on Loom](https://www.loom.com/share/8bb9f5e4262d42f8a14e2481bac17089)** — a walkthrough of the business flow, integrations, duplicate protection, and error recovery.
 
 ## Business problem
 
